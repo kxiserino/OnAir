@@ -432,7 +432,7 @@ Json diagnose(ToolCtx& c, const Json& st, const Json& tel, const SpecInfo& sp) {
             add("The SNR (" + std::to_string((int)q->numOr("snrDb", 0)) + " dB) is below what this mode needs (" + std::to_string((int)q->numOr("requiredDb", 0)) + " dB): a better antenna, a filter or a different gain is needed.");
         if (!tel.boolOr("locked", false) && rate > 0) {
             for (const ModeRow& r : rows) if (r.family == (int)st.numOr("family", -1)) {
-                const ModeTuning* m = modeTuning(r.family);
+                const ModeTuning* m = modeTuning(r.family + 2);   // the engine standard is the family + 2 (mode_tuning.h): the family itself named another mode's rate
                 if (m && m->minSampleRate > rate + 1) add("The sample rate (" + std::to_string(rate / 1e6) + " Msps) is below the " + std::to_string(m->minSampleRate / 1e6) + " Msps this mode needs: raise it with set_radio.");
                 break;
             }
@@ -504,7 +504,7 @@ std::vector<Tool> makeTools() {
         t.idempotent = true;
         t.fn = [](ToolCtx& c, const Json& a) {
             std::string err;
-            Json done = Json::array();
+            Json done = Json::array(), notes = Json::array();
             if (a.has("device")) {
                 if (isRunning(c) && !c.host.stop(err)) throw ToolError("could not stop the receiver: " + err);
                 err.clear();
@@ -516,6 +516,11 @@ std::vector<Tool> makeTools() {
                 if (r < 0) throw ToolError("sample_rate_msps must be 0 or more");
                 if (!c.host.setSampleRateHz(r * 1e6, err)) throw ToolError("sample rate: " + err);
                 done.push(Json::string("sample_rate"));
+                // "changed" is the setting; the radio may still run at another rate (a SpyServer gives a guest at most what its owner allows): say so
+                const double now = c.eng && c.eng->sampleRate() > 0 ? c.eng->sampleRate() : status(c).numOr("sampleRateHz", 0);
+                if (r > 0 && now > 0 && std::fabs(now - r * 1e6) > 0.01 * r * 1e6)
+                    notes.push(Json::string("the radio runs at " + std::to_string(now / 1e6) + " Msps, not the " + std::to_string(r) +
+                                            " asked: the radio or its server keeps it there (a SpyServer limits what a guest may use)"));
             }
             if (a.has("auto_gain")) {
                 if (!c.host.setAutoGain(a.boolOr("auto_gain", false), err)) throw ToolError("auto gain: " + err);
@@ -542,6 +547,7 @@ std::vector<Tool> makeTools() {
             }
             Json o = Json::object();
             o.set("changed", done);
+            if (!notes.arr.empty()) o.set("notes", notes);
             o.set("status", statusSummary(c));
             return o;
         };
