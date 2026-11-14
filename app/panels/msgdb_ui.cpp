@@ -202,10 +202,11 @@ void windowPanel(App& a) {
     }
     ImGui::SameLine();
     ch |= ImGui::Checkbox(tr("With position"), &S.posOnly);
-    ImGui::SameLine();
+    // the first row is full at the window's first width: this starts the second one, where it is always in view
     ch |= ImGui::Checkbox(tr("Readable text only"), &S.readable);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("ACARS, VDL2, HFDL and Inmarsat Aero messages that a person wrote or reads (free text, weather, operations notes); "
                                                            "no ADS-C, CPDLC, FMS and datalink data, encrypted blocks or acknowledgements, and no other modes"));
+    ImGui::SameLine();
     ImGui::SetNextItemWidth(90 * gUi); ch |= ImGui::InputFloat("##flo", &S.fLoMHz, 0, 0, "%.4f");
     ImGui::SameLine(); ImGui::TextUnformatted("-"); ImGui::SameLine();
     ImGui::SetNextItemWidth(90 * gUi); ch |= ImGui::InputFloat("##fhi", &S.fHiMHz, 0, 0, "%.4f");
