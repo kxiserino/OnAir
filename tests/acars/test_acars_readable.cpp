@@ -40,6 +40,27 @@ int main() {
     CHECK(!acarsReadable("41", "MSG0209c8N4841cL0j-G!Hc\r\nLqm\"SMa`gLRaMxtg0^FSMagjpSFagUxFg+NB G\r\ne|Lgr>aSFUSFS>MSgGUUSMaS&gWp^$vag!S$^x>@"),
           "a scrambled block with enough letters: too many odd symbols");
 
+    // real Inmarsat Aero messages of one night (the user's database): two scrambled blocks that have enough letters, and real ones that
+    // must stay (a crew notice, a turbulence report, a ZFW load message, a loadsheet)
+    struct Real { const char* reg; const char* label; const char* text; bool readable; };
+    const Real real[] = {
+    {"N45JE", "41", "MSG0209c8N4841cL0j-G!Hc\r\nLqm\"SMa`gLRaMxtg0^FSMagjpSFagUxFg+NB G\r\ne|Lgr>aSFUSFS>MSgGUUSMaS&gWp^$vag!S$^x>@\r\nHvSgFS$^x>gwxqgRFSgS>aSF^>$gvR@gmSS>g^&S>a^U^S&gmwgGjLjgR@gRg2x@@^mpSgRUUSMaS&gFS$^x>gUxFgepxmRpg+R_^$Ra^x>RpgLRaSpp^aSgLw@aSt@gxFge|", false},
+    {"D-AIMM", "3L", "573924E3AR732MFree Text DABYF LH 572,0002,69[d@k<[Ol$bb|t|j4Rwhl\?lQ\"xzwlldH}jH!=w\r\n~wkac|ralRuFRbwr\\twH)H\\$yO{cb=qy.Kin==hR]l^z`\r\nu$hugOQ\?geH[h^%jHjw=tOt|=^wnkKt|^!wsljR'j`Q\?g~\r\nl\\'\?Hzde$eObqy&oq'Kc|od\"^ta.K`zhqqzt\"\r\ndxgw'\?~\\\".H>%ww|oO&c|K\"", false},
+    {"9V-SWG", "31", ".SKYSWSQ 140109 CPYXXXX        \r\nSQ0026\r\nFROM OCC\r\nHI CAPT AND CREW\r\nUS FAA HAS ANNOUNCED A NATIONWIDE GROUND STOP\r\nDUE TO COMMUNICATION ISSUES.\r\nHOWEVER, SQ FLIGHTS ARE STILL OPERATING NORMALLY.\r\nDFC", true},
+    {"HL8046", "C1", ".DDLIRXA 140107\r\nAGM\r\nAN HL8046/MA 005A\r\n-  WSI FPG INTERSECTION\r\nTYPE: TURB CAT\r\nID: 44246\r\nINTERSECTION TIME: 01:37:08Z\r\nVALID: 00:00:00Z-03:00:00Z\r\nSEVERITY: OCNL MOD\r\nENTRY/EXIT: 4329N8054E / 4344N9009E\r\nALT: FL320-FL400\r\nMVT:\r\nDISC: TE", true},
+    {"G-ZBKI", "13", ":PAD12.LHRLDBA.ZFW\r\nAZF/GZBKI/BA0134\r\n- PAX/191 INCLUDING 002 INF\r\n- CGO/016163\r\n- ZFW/169880\r\n- CRW/03/09\r\n- FWT/062191\r\n- OWT/192889\r\n- TTL/038644\r\n- TOW/231533\r\n- DEP/0210\r\n- SEC/BOM-LHR\r\nFLT STATUS:CLOSED\r\nLCO:SIMON STACHEL\r\nSI ISSUED O", true},
+    {"HZ-AS52", "30", "ANTRY CODE  E  \r\nCHECKED BAGGAGE PIECES\r\nJED 3/TI/24/TD/35 4/Q/8/J/9/Y/23\r\nPREPARED BY JAN/PODESVA 420  221101434\r\nSERVICE WEIGHT ADJUSTMENT WEIGHT/INDEX\r\nDEDUCTIONS\r\nNIL\r\nALHAZMI\r\nBW  42655\r\nCREW EFFECT  506 / 1.4 -\r\nJED C       0 M       ", true},
+    };
+    for (const Real& r : real) CHECK(acarsReadable(r.label, r.text) == r.readable, "%s label %s: %s", r.reg, r.label, r.readable ? "real text dropped" : "scrambled block let through");
+
+    // a readable header over one scrambled line: the whole text has few odd symbols, the line many
+    CHECK(!acarsReadable("3L", "FREE TEXT FROM THE DISPATCH OFFICE ABOUT THE LATE ARRIVAL OF THE CREW BUS AT THE GATE TODAY\r\n"
+                               "PLEASE ADVISE THE CAPTAIN AND THE PURSER ABOUT THE NEW TIMES FOR THE RETURN FLIGHT\r\n[d@k<[Ol$bb|t|j4Rwhl"),
+          "one scrambled line under a long readable header");
+    CHECK(!acarsReadable("10", "PLEASE CHECK gLRaMxtg SMagjpSFag GUUSMaS NOW"), "words with capitals inside");
+    CHECK(acarsReadable("10", "Hi Capt And Crew, Welcome Back To Singapore"), "mixed case at the start of words stays");
+    CHECK(acarsReadable("RA", "QUTYOAONH~1DIS01140152\r\nWX INFO\r\nAUTO UPLINK FOR THE ARRIVAL AT TOKYO HANEDA AIRPORT"), "one ~ of an uplink header stays");
+
     // HFDL / VDL2 summary lines
     std::string lb, tx;
     CHECK(acarsFromSummary("ACARS SA (Media advisory) SU1187: 0EH174253VH", lb, tx) && lb == "SA" && tx == "0EH174253VH", "summary parsed: %s / %s", lb.c_str(), tx.c_str());

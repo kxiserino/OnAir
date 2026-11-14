@@ -34,18 +34,32 @@ inline bool acarsReadableText(const std::string& raw) {
     for (const char* p : {"- #MD", "- #DF", "- #EI", "#M1", "/"}) if (t.compare(0, std::string(p).size(), p) == 0) return false;
     if (t.find("- #DF") != std::string::npos || t.find("- #MD") != std::string::npos) return false;
     if (t.size() < 12) return false;
-    size_t letters = 0, words = 0, run = 0, odd = 0;
+    size_t letters = 0, words = 0, run = 0, odd = 0, camel = 0;
+    size_t lineLen = 0, lineOdd = 0;
+    bool lower = false, camelWord = false;
     auto isLetter = [](unsigned char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c >= 0x80; };
+    auto isOdd = [](unsigned char c) { return c && std::strchr("!\"$&^|<>@{}[]`\\~", (int)c); };
+    // one scrambled line under a readable header: the share of odd symbols over the whole text stays low, that of the line does not
+    auto lineEnd = [&] { const bool bad = lineLen >= 16 && lineOdd >= 3 && lineOdd * 10 > lineLen; lineLen = lineOdd = 0; return bad; };
+    auto wordEnd = [&] { if (run >= 3) { words++; if (camelWord) camel++; } run = 0; lower = camelWord = false; };
     for (unsigned char c : t) {
-        if (isLetter(c)) { letters++; run++; continue; }
+        if (c == '\n' || c == '\r') { if (lineEnd()) return false; }
+        else lineLen++;
+        if (isLetter(c)) {
+            letters++; run++;
+            if (c >= 'A' && c <= 'Z' && lower) camelWord = true;   // a capital after a small letter inside a word: "gLRaMxtg"
+            lower = c >= 'a' && c <= 'z';
+            continue;
+        }
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') letters++;   // whitespace counts with the letters
-        if (std::strchr("!\"$&^|<>@{}[]`\\~", (int)c) && c) odd++;
-        if (run >= 3) words++;
-        run = 0;
+        if (isOdd(c)) { odd++; lineOdd++; }
+        wordEnd();
     }
-    if (run >= 3) words++;
-    // symbols that written text hardly has: more than 2 % is a scrambled or binary block that still has enough letters (label 41 "MSG0209c8N...|Lgr>a")
-    return letters * 10 >= t.size() * 6 && words >= 3 && odd * 50 <= t.size();
+    wordEnd();
+    if (lineEnd()) return false;
+    // symbols that written text hardly has: more than 2 % is a scrambled or binary block that still has enough letters (label 41 "MSG0209c8N...|Lgr>a");
+    // three or more words with a capital inside (aviation text is in capitals, mixed text has them at the start of a word) are scrambled too
+    return letters * 10 >= t.size() * 6 && words >= 3 && odd * 50 <= t.size() && camel < 3;
 }
 
 inline bool acarsReadable(const std::string& label, const std::string& text) { return !acarsMachineLabel(label) && acarsReadableText(text); }

@@ -8,6 +8,7 @@
 #include "ui/kit/mode_frame.h"
 #include "ui/kit/session_list.h"
 #include "dect2/acars/acars_readable.h"
+#include "dect2/msgdb/msgdb.h"
 #include "dect2/aero/aero_tel.h"
 #include "dect2/audio/audioout.h"
 #include <algorithm>
@@ -166,6 +167,52 @@ void notDecodedNote() {
 
 // ---------------------------------------------------------------- views
 
+// "readable text only" reads the message database (View > Messages: every message kept, not the receiver's last ones), where about 1 message
+// in 100 passes; the receiver's own list would hold only a handful of them. Newest first, read again every 2 s. Empty when the database is off.
+const std::vector<dect2::AeroMessage>& readableHistory() {
+    static std::vector<dect2::AeroMessage> rows;
+    static double at = -10;
+    if (ImGui::GetTime() - at < 2.0) return rows;
+    at = ImGui::GetTime();
+    rows.clear();
+    namespace mdb = dect2::msgdb;
+    mdb::Db& db = mdb::global();
+    if (!db.isOpen()) return rows;
+    mdb::Filter f;
+    f.type = "msg.aero";
+    f.readableOnly = true;
+    f.limit = 1000;
+    for (const mdb::Record& r : db.query(f)) {   // the extra "key=value" lines back into a message (aero_rx.cpp writes them)
+        auto field = [&](const char* k) -> std::string {
+            const std::string key = std::string(k) + "=";
+            for (size_t i = 0; i < r.extra.size();) {
+                size_t e = r.extra.find('\n', i);
+                if (e == std::string::npos) e = r.extra.size();
+                if (r.extra.compare(i, key.size(), key) == 0) return r.extra.substr(i + key.size(), e - i - key.size());
+                i = e + 1;
+            }
+            return std::string();
+        };
+        dect2::AeroMessage m;
+        m.time = r.time + (double)r.id * 1e-7;   // the selection key: unique even for two messages in the same second
+        m.wallTime = (int64_t)r.time;
+        m.registration = field("registration"); m.flight = field("flight"); m.label = field("label"); m.labelText = field("label_text");
+        m.aesId = (uint32_t)strtoul(field("aes").c_str(), nullptr, 16);
+        const std::string crc = field("crc_ok"), up = field("uplink");
+        m.crcOk = crc.empty() || crc == "true" || crc == "1";
+        m.uplink = up.empty() || up == "true" || up == "1";
+        m.bitRate = atoi(field("bit_rate").c_str());
+        const std::string ges = field("ges_id");
+        m.gesId = ges.empty() ? -1 : atoi(ges.c_str());
+        m.decoded = field("decoded");
+        m.text = r.text;
+        m.hasPos = r.hasPos; m.lat = r.lat; m.lon = r.lon;
+        rows.push_back(std::move(m));
+    }
+    std::reverse(rows.begin(), rows.end());   // oldest first, like the receiver's list (the table draws it backwards)
+    return rows;
+}
+
 bool passes(const dect2::AeroMessage& m) {
     if (!m.crcOk && !S.badToo) return false;
     if (S.fLabel[0] && lower(m.label).rfind(lower(S.fLabel), 0) != 0) return false;
@@ -189,7 +236,8 @@ void filterRow() {
     flowNext(12 * gUi);
     ImGui::Checkbox("readable text only", &S.readable);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Only text a person wrote or reads (free text, weather, operations notes): no ADS-C, CPDLC, FMS and datalink data, "
-                                                  "encrypted blocks or acknowledgements. About 1 message in 100 on a P channel.");
+                                                  "encrypted blocks or acknowledgements. About 1 message in 100 on a P channel, so the list comes from the whole "
+                                                  "message history (View > Messages, the last 1000 that pass), not just the receiver's recent messages.");
     flowEnd();   // the filters wrap in a narrow tab
 }
 
@@ -220,8 +268,10 @@ void detailPane(const App& a, const dect2::AeroMessage* m) {
 
 void messageView(App& a) {
     const dect2::AeroTelemetry& t = a.rx.aero;
-    const bool on = live(a);
     filterRow();
+    const bool fromDb = S.readable && dect2::msgdb::global().isOpen();   // readable text only: the whole history of the message database
+    const std::vector<dect2::AeroMessage>& list = fromDb ? readableHistory() : t.messages;
+    const bool on = live(a) || fromDb;
     const float H = ImGui::GetContentRegionAvail().y;
     const float listH = std::max(120.f * gUi, H * 0.58f);
     if (ImGui::BeginTable("##aomsg", 7, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_BordersInnerV, ImVec2(0, listH))) {
@@ -231,8 +281,8 @@ void messageView(App& a) {
         ImGui::TableHeadersRow();
         int shown = 0;
         if (on) {
-            for (size_t i = t.messages.size(); i-- > 0;) {          // newest on top
-                const auto& m = t.messages[i];
+            for (size_t i = list.size(); i-- > 0;) {          // newest on top
+                const auto& m = list[i];
                 if (!passes(m)) continue;
                 shown++;
                 ImGui::TableNextRow();
@@ -249,12 +299,12 @@ void messageView(App& a) {
         }
         ImGui::EndTable();
         if (!on) { ImGui::PushTextWrapPos(0); ImGui::TextDisabled("%s", a.engine.running() ? "starting" : "start the receiver to see messages"); ImGui::PopTextWrapPos(); }
-        else if (!shown) { ImGui::PushTextWrapPos(0); ImGui::TextDisabled(t.messages.empty() ? "no message yet (aircraft messages are rare: a busy channel gives a few a minute)" : "no message matches the filter"); ImGui::PopTextWrapPos(); }
+        else if (!shown) { ImGui::PushTextWrapPos(0); ImGui::TextDisabled(list.empty() ? "no message yet (aircraft messages are rare: a busy channel gives a few a minute)" : "no message matches the filter"); ImGui::PopTextWrapPos(); }
     }
     ImGui::Spacing();
     ImGui::BeginChild("##aodet", ImVec2(0, 0));
     const dect2::AeroMessage* sel = nullptr;
-    if (on) for (const auto& m : t.messages) if (m.time == S.selectedTime) sel = &m;
+    if (on) for (const auto& m : list) if (m.time == S.selectedTime) sel = &m;
     detailPane(a, sel);
     ImGui::EndChild();
 }
