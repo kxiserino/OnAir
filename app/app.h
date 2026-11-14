@@ -456,6 +456,12 @@ struct App {
     std::vector<float> smoothPow, specView;   // the trace averaged in power; the frame as the plots show it (dB per Hz with specPerHz)
     bool specPerHz = true;              // levels in dB per Hz: the noise floor stays where it is when the FFT size changes (else per bin)
     uint64_t lastSeq = 0;
+    // a KiwiSDR's own waterfall (kiwiSpecOn): its frames take the place of the engine's in specView / smooth / peak and the waterfall rows,
+    // over their own band (specBand); a.spec keeps the engine's frame (levels, decoders)
+    KiwiSpectrum kiwiSpec;
+    double kiwiSpecT = 0;               // when its newest frame came in (glfwGetTime); 0: none
+    uint64_t kiwiShownSeq = 0;          // the Kiwi frame last put into the plots
+    std::string kiwiWfAddr;             // the Kiwi whose waterfall this receiver shows (host:port); "" none
     Waterfall wf;
     float yMin = -110, yMax = -30;
     bool specAutoDb = true;             // the spectrum's dB range follows the noise floor of the view (the look says how high it sits); a drag of Min/Max turns it off
@@ -1151,6 +1157,21 @@ void wideSync(App& a);                                  // once a frame: pushes 
 void wideCarrierCell(const App& a, int carrierId, double relHz);   // a table cell with the carrier's frequency (MHz); "-" for a single channel
 void wideCarriersTable(App& a, float h);                // the carriers table: click selects (sound, detail), double click tunes
 double radioCenterMhz(const App& a);   // where the radio is tuned: the frequency plus the mode's tuneOffsetHz (a file source: the frequency as typed)
+// The band of the displayed trace (smooth, peak, specView) and of the waterfall rows: the radio's capture (radioCenterMhz +- the rate / 2), or
+// a KiwiSDR's own waterfall frame while kiwiSpecOn. axisBand: the band the frequency axis may pan and zoom over (a Kiwi: all of 0 to 30 MHz).
+// The bins of n values over a band: bin i is centred on firstMhz + i * spanMhz / n (the engine's FFT: firstMhz = loMhz, DC-centred; a Kiwi's:
+// half a bin in, its bins start at loMhz). The waterfall picture of the bins starts half a bin before firstMhz.
+struct SpecBand {
+    double loMhz = 0, spanMhz = 0;
+    bool halfBin = false;   // the first bin is centred half a bin above loMhz (a Kiwi's)
+    double centreMhz() const { return loMhz + spanMhz / 2; }
+    double hiMhz() const { return loMhz + spanMhz; }
+    double firstMhz(size_t n) const { return loMhz + (halfBin && n ? spanMhz / (2.0 * (double)n) : 0.0); }
+    double imageLoMhz(size_t n) const { return firstMhz(n) - (n ? spanMhz / (2.0 * (double)n) : 0.0); }
+};
+bool kiwiSpecOn(const App& a);         // the selected radio is a KiwiSDR with its waterfall on, and its frames are coming in
+SpecBand specBand(const App& a);
+SpecBand axisBand(const App& a);
 // IQ recordings: the spectrum stays on the recording's centre; the tune box only moves the demodulator offset (app/gfx/file_vfo.h)
 bool fileSourceSelected(const App& a);        // an IQ file is the chosen source
 bool fileVfoActive(const App& a);             // ... and it runs

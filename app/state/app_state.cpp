@@ -481,7 +481,7 @@ double specBinsPerPixel();   // plots.cpp: FFT bins per pixel column of the spec
 // Fast waterfall rows (Waterfall::fast(), the CW preset): the engine makes a row every 1/rowsPerSec seconds from its own short transforms and queues
 // them; a frame of the screen takes whatever has come (several rows) and writes them all, so the rate does not depend on the frame rate.
 static void fastRowsIngest(App& a) {
-    const double want = a.wf.fast() ? a.wf.rowsPerSec : 0;
+    const double want = a.wf.fast() && !kiwiSpecOn(a) ? a.wf.rowsPerSec : 0;   // a Kiwi's own waterfall writes the rows itself
     if (a.wf.fastSent != want) { a.engine.setSpectrumFastRows(want); a.wf.fastSent = want; }
     if (want <= 0) return;
     static std::vector<float> rows;   // (one waterfall per App; the buffer ping-pongs with the engine's queue: no allocation in the steady state)
@@ -511,12 +511,59 @@ static void fastRowsIngest(App& a) {
     (void)dt;
 }
 
+// ---- a KiwiSDR's own waterfall (dect2/net/kiwisdr.h, docs/kiwisdr.md) ----------------------------------------------------------------------
+// The selected radio's host:port when it is a KiwiSDR whose waterfall setting is on (default), else ""
+static std::string kiwiWfAddrOf(const App& a) {
+    if (a.devIdx < 0 || a.devIdx >= (int)a.devices.size()) return {};
+    const DeviceInfo& d = a.devices[a.devIdx];
+    if (d.board != "kiwisdr" || !radioFlag(a.tune, "kiwiwf", true)) return {};
+    return d.nativeArgs;
+}
+// frames older than this: the waterfall stream is gone, the plots go back to the IQ spectrum. Not shorter: a Kiwi whose waterfall is shared
+// (more receivers than waterfalls) sends a few frames a second, and pauses for seconds after a new zoom
+static constexpr double kKiwiStaleSec = 10.0;
+
+bool kiwiSpecOn(const App& a) {
+    return a.engine.running() && !a.kiwiSpec.dbm.empty() && a.kiwiSpecT > 0 && glfwGetTime() - a.kiwiSpecT < kKiwiStaleSec && !kiwiWfAddrOf(a).empty();
+}
+
+SpecBand specBand(const App& a) {
+    if (kiwiSpecOn(a)) return {a.kiwiSpec.startHz / 1e6, a.kiwiSpec.spanHz() / 1e6, true};
+    const double fs = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6;
+    return {radioCenterMhz(a) - fs / 2, fs};
+}
+
+SpecBand axisBand(const App& a) {
+    if (kiwiSpecOn(a)) return {0.0, a.kiwiSpec.bandwidthHz / 1e6};
+    return specBand(a);
+}
+
+// Once a frame: the view on screen goes to the source (it asks the Kiwi for the zoom and centre that cover it), the newest Kiwi frame comes in.
+// True when a new frame was taken. The view starts as the capture band, so the Kiwi's waterfall is asked for before the axis widens to 0..30 MHz.
+// Per receiver (each App): a second receiver on another radio must not touch this one's view.
+static bool kiwiIngest(App& a) {
+    const std::string hp = a.engine.running() ? kiwiWfAddrOf(a) : std::string();
+    if (hp != a.kiwiWfAddr) {   // another radio, the setting off or the radio stopped (the source closes the waterfall with the IQ)
+        if (!a.kiwiWfAddr.empty()) kiwiSetSpectrumView(a.kiwiWfAddr, 0, 0);
+        a.kiwiWfAddr = hp;
+        a.kiwiSpec = KiwiSpectrum(); a.kiwiSpecT = 0; a.kiwiShownSeq = 0;
+    }
+    if (hp.empty()) return false;
+    double lo = 0, hi = 0;
+    specFreqViewGet(lo, hi);
+    if (!(hi > lo)) { const SpecBand b = specBand(a); lo = b.loMhz; hi = b.hiMhz(); }
+    kiwiSetSpectrumView(hp, (lo + hi) / 2 * 1e6, (hi - lo) * 1e6);
+    if (!kiwiSpectrum(hp, a.kiwiSpec, a.kiwiSpec.seq)) return false;
+    a.kiwiSpecT = glfwGetTime();
+    return true;
+}
+
 // The zoom spectrum (4.0, docs/WATERFALL-4.0.md): the view the plots asked for goes to the engine (which runs a zoom transform only when the
 // full-band bins are coarser than the pixels), its newest frame into the zoom trace lines (gfx/zoom_detail.h), and its colour range.
 static void zoomIngest(App& a, double now, float dt) {
     // not while the window is minimised or covered (no one sees it: the transform's CPU is saved)
     const bool unseen = gWindow && (glfwGetWindowAttrib(gWindow, GLFW_ICONIFIED) || ::power::windowOccluded(gWindow));
-    const bool want = a.specZoomFft && a.zd.wanted(now) && a.engine.running() && !unseen;
+    const bool want = a.specZoomFft && a.zd.wanted(now) && a.engine.running() && !unseen && !kiwiSpecOn(a);   // a Kiwi's own waterfall is already zoomed by the Kiwi
     if (want) a.engine.setSpectrumZoom(a.zd.reqOffHz, a.zd.reqSpanHz, a.zd.reqPx, (size_t)std::max(512, a.specZoomMaxBins));
     else a.engine.setSpectrumZoom(0, 0, 0);
     if (!want || !a.engine.spectrumZoomPlan().on) { a.zd.off(); return; }
@@ -529,6 +576,8 @@ static void zoomIngest(App& a, double now, float dt) {
     const double lo = rc + (a.zd.reqOffHz - a.zd.reqSpanHz * 0.5) / 1e6, hi = lo + a.zd.reqSpanHz / 1e6;
     a.zd.fitRange(a.wf.autoTrack, a.wf.minDb, a.wf.maxDb, a.wf.autoBelow, a.wf.autoSpan, lo, hi, now);
 }
+
+static void showFrame(App& a, const SpecBand& band, int missed);
 
 void ingestSpectrum(App& a) {
     syncSpectrumEngine(a);
@@ -544,6 +593,18 @@ void ingestSpectrum(App& a) {
         const double fsMhz = a.tune.sampleRate > 0 ? a.tune.sampleRate / 1e6 : 10.0;
         slook::demoSpectrum(a.spec.dbfs, 8192, radioCenterMhz(a), fsMhz, t, (uint32_t)(a.lastSeq + 1));
         a.spec.seq = a.lastSeq + 1;
+    } else if (kiwiIngest(a) || kiwiSpecOn(a)) {   // a KiwiSDR's own waterfall: its frames are what the plots show, over their own band
+        if (a.engine.latestSpectrum(a.spec, a.lastSeq)) { a.lastSeq = a.spec.seq; clipsui::feed(a.spec.dbfs); }   // the IQ's frame still feeds the levels and the clips
+        if (a.kiwiSpec.seq == a.kiwiShownSeq) return;   // no new Kiwi frame
+        const bool first = a.kiwiShownSeq == 0;
+        a.kiwiShownSeq = a.kiwiSpec.seq;
+        // the levels in the plots' scale: the Kiwi's dBm less the radio's dBm offset (the plot adds it back and shows dBm: the Kiwi's own numbers)
+        const float off = dbmOffset(a);
+        a.specView.resize(a.kiwiSpec.dbm.size());
+        for (size_t i = 0; i < a.specView.size(); i++) a.specView[i] = a.kiwiSpec.dbm[i] - off;
+        if (first && a.wf.autoTrack) a.wf.fitRange(a.specView, true);   // another scale than the IQ's: the colours fit at once, not over seconds of rows
+        showFrame(a, specBand(a), 0);
+        return;
     } else
     if (!a.engine.latestSpectrum(a.spec, a.lastSeq)) {   // straight into the kept frame: no copy that allocates, 30 times a second
         fastRowsIngest(a);
@@ -553,9 +614,6 @@ void ingestSpectrum(App& a) {
     const SpectrumFrame& f = a.spec;
     const uint64_t prevSeq = a.lastSeq;
     a.lastSeq = f.seq;
-    const double now = glfwGetTime();
-    const float dt = a.specLastT > 0 ? (float)std::min(0.5, std::max(0.001, now - a.specLastT)) : 1.f / 30;
-    a.specLastT = now;
     size_t n = f.dbfs.size();
     // the frame as the plots show it: dB per Hz (the floor does not move when the FFT size changes) or the engine's dB per bin
     {
@@ -565,6 +623,17 @@ void ingestSpectrum(App& a) {
         const float* src = f.dbfs.data(); float* dst = a.specView.data();
         for (size_t i = 0; i < n; i++) dst[i] = src[i] - off;
     }
+    // frames the screen did not take (it drew slower than they came): the row is repeated for them, so the picture keeps its true speed (#246)
+    showFrame(a, specBand(a), a.wf.rowsPerSec <= 0 ? specaxis::missedRows(prevSeq, f.seq) : 0);
+    clipsui::feed(f.dbfs);   // radio clips: the retroactive history
+}
+
+// a.specView (the new frame as the plots show it, over band) into the trace lines, the hold lines and the waterfall rows
+static void showFrame(App& a, const SpecBand& band, int missed) {
+    const double now = glfwGetTime();
+    const float dt = a.specLastT > 0 ? (float)std::min(0.5, std::max(0.001, now - a.specLastT)) : 1.f / 30;
+    a.specLastT = now;
+    const size_t n = a.specView.size();
     if (a.smooth.size() != n || a.peak.size() != n) { a.smooth = a.specView; a.peak = a.specView; a.minPk.clear(); a.smoothPow.clear(); }   // the lines always have the frame size (a retune clears the hold lines)
     if (a.minHold && a.minPk.size() != n) a.minPk = a.specView;
     const float fall = a.holdDecay * dt;
@@ -580,14 +649,12 @@ void ingestSpectrum(App& a) {
         if (a.holdDecay > 0) for (size_t i = 0; i < n; i++) mn[i] = std::min(mn[i] + fall, in[i]);
         else for (size_t i = 0; i < n; i++) mn[i] = std::min(mn[i], in[i]);
     }
-    {   // the history has the width the detail setting and the FFT give (#243), and follows the radio: a retune moves the rows along (#270)
-        const double fsMhz = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6;
-        a.wf.setCols(specaxis::historyCols(a.wf.detail, a.wf.fast() && a.wf.fastBins ? a.wf.fastBins : n, Waterfall::kMaxCols));
-        a.wf.follow(radioCenterMhz(a), fsMhz);   // also while paused: the frozen picture must stay under its frequencies
-    }
-    // frames the screen did not take (it drew slower than they came): the row is repeated for them, so the picture keeps its true speed (#246)
-    const int missed = a.wf.rowsPerSec <= 0 ? specaxis::missedRows(prevSeq, f.seq) : 0;
-    if (a.wf.fast()) fastRowsIngest(a);   // the rows come from the engine's own short transforms, in batches
+    // the history has the width the detail setting and the FFT give (#243), and follows the band: a retune (or a pan of a Kiwi's waterfall)
+    // moves the rows along (#270), a new span starts them again. Also while paused: the frozen picture must stay under its frequencies
+    const bool kiwi = kiwiSpecOn(a);
+    a.wf.setCols(specaxis::historyCols(a.wf.detail, a.wf.fast() && a.wf.fastBins && !kiwi ? a.wf.fastBins : n, Waterfall::kMaxCols));
+    a.wf.follow(band.centreMhz(), band.spanMhz);
+    if (a.wf.fast() && !kiwi) fastRowsIngest(a);   // the rows come from the engine's own short transforms, in batches
     else if (a.wf.offer(a.specView, now, missed)) {
         const int k = a.wf.slow() ? 1 : 1 + missed;   // one time stamp per row, spread over the gap
         const double t0 = a.wf.pushT > 0 && a.wf.pushT < now ? a.wf.pushT : now;
@@ -597,7 +664,6 @@ void ingestSpectrum(App& a) {
     zoomIngest(a, now, dt);
     a.zd.sync(a.wf.rows, a.wf.writeRow, a.wf.histC, !a.wf.fast(), now);   // the zoom rows beside the rows just written
     roomsFeedRow(a.specView, a.wf.minDb, a.wf.maxDb);   // Live rooms (a flag check when not live)
-    clipsui::feed(f.dbfs);   // radio clips: the retroactive history
     if (a.wf.autoTrack && !a.wf.paused && now - a.wf.trackT > 0.25) {
         const float tdt = a.wf.trackT > 0 ? (float)std::min(2.0, now - a.wf.trackT) : 0.25f;
         a.wf.trackT = now; a.wf.fitRange(a.smooth, false, tdt);
@@ -776,9 +842,9 @@ double radioCenterMhz(const App& a) {
 std::vector<double> xs(const App& a) {
     size_t n = a.smooth.size();
     std::vector<double> x(n);
-    double fs = a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate;
-    double c = radioCenterMhz(a);
-    for (size_t i = 0; i < n; i++) x[i] = c + ((double)i / n - 0.5) * fs / 1e6;
+    const SpecBand b = specBand(a);   // the band of the trace (a Kiwi's own waterfall has its own)
+    const double x0 = b.firstMhz(n);
+    for (size_t i = 0; i < n; i++) x[i] = x0 + (double)i / n * b.spanMhz;
     return x;
 }
 

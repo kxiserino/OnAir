@@ -133,8 +133,9 @@ void waterfall3dPlot(App& a, ImVec2 size) {
     dl->PushClipRect(o, ImVec2(o.x + sz.x, o.y + sz.y), true);
 
     // ---- the data: the columns in view (the spectrum's frequency range), decimated to the budget
-    const double fs = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6;
-    const double x0 = specaxis::imageLo(radioCenterMhz(a), fs, a.smooth.empty() ? (size_t)a.wf.cols : a.smooth.size());
+    const SpecBand sb = specBand(a);   // the rows' band: the radio's, or a Kiwi's own waterfall frame's
+    const double fs = sb.spanMhz;
+    const double x0 = sb.imageLoMhz(a.smooth.empty() ? (size_t)a.wf.cols : a.smooth.size());
     const int W = a.wf.cols;
     double lo = 0, hi = 0;
     specFreqViewGet(lo, hi);

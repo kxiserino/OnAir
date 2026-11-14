@@ -53,10 +53,11 @@ int chosen(const App& a, double lo, double hi) {
 
 bool takeSnapshot(App& a, const std::string& label) {
     if (a.smooth.empty()) return false;
-    const double fsMhz = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6, rc = radioCenterMhz(a);
+    const SpecBand sb = specBand(a);   // the trace's band (a Kiwi's own waterfall has its own)
+    const double fsMhz = sb.spanMhz;
     if (fsMhz <= 0) return false;
     const int64_t now = nowSec();
-    if (!sghost::save(dirNow(), sghost::make(a.smooth.data(), a.smooth.size(), rc - fsMhz / 2, rc + fsMhz / 2, now, label))) { g.note = "could not write the snapshot folder"; return false; }
+    if (!sghost::save(dirNow(), sghost::make(a.smooth.data(), a.smooth.size(), sb.loMhz, sb.hiMhz(), now, label))) { g.note = "could not write the snapshot folder"; return false; }
     g.lastAuto = now; g.curWhen = -1;
     sghost::prune(dirNow(), a.ghostKeep);
     rescan();

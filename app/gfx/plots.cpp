@@ -184,8 +184,9 @@ static void centreClick(App& a, double mhz) {   // the target style's click: the
     spectrumTune(a, mhz);
     const double newC = radioCenterMhz(a);
     if (a.centreTuning && a.tuningMode != 1 && std::fabs(newC - oldC) > 1e-9 && gXHi > gXLo) {   // the radio moved to the click: the view follows, the signal in its middle
+        const SpecBand ax = axisBand(a);   // the radio's band around newC, or a Kiwi's whole band
         const double fs = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6;
-        const tunedrag::View v = tunedrag::centreView(gXLo, gXHi, mhz, newC - fs / 2, newC + fs / 2);
+        const tunedrag::View v = kiwiSpecOn(a) ? tunedrag::centreView(gXLo, gXHi, mhz, ax.loMhz, ax.hiMhz()) : tunedrag::centreView(gXLo, gXHi, mhz, newC - fs / 2, newC + fs / 2);
         gXLo = v.lo; gXHi = v.hi;
     }
 }
@@ -662,12 +663,31 @@ static void markerLayer(const App& a, bool labels) {
 constexpr double kFreqSpanMinMhz = 0.001;   // 1 kHz at full zoom-in
 
 // The spectrum and the waterfall share one frequency axis: panning or zooming either moves both, and a retune brings both back to the band.
+// A KiwiSDR's own waterfall (kiwiSpecOn) widens the axis to the Kiwi's whole band; the view the user had stays. A retune that puts the
+// tuned frequency out of the view (the frequency box, a memory) brings the view over to it, the span kept.
+static void kiwiViewFollow(const App& a) {
+    static double lastRc = 0;
+    const double rc = radioCenterMhz(a);
+    if (rc == lastRc) return;
+    lastRc = rc;
+    if (!kiwiSpecOn(a) || !(gXHi > gXLo) || (a.freqMhz >= gXLo && a.freqMhz <= gXHi)) return;
+    const SpecBand ax = axisBand(a);
+    const double span = std::min(ax.spanMhz, gXHi - gXLo);
+    gXLo = std::max(ax.loMhz, std::min(a.freqMhz - span / 2, ax.hiMhz() - span));
+    gXHi = gXLo + span;
+}
+// the axis band grew to a Kiwi's whole band (its waterfall came in): the view is kept, not widened to all of it
+static bool kiwiWidened(const App& a, double fs, double lastFs) { return kiwiSpecOn(a) && lastFs > 0 && fs > lastFs && gXHi > gXLo; }
+
 static void setupFreqAxis(const App& a) {
-    const double fs = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6;
+    kiwiViewFollow(a);
+    const SpecBand ax = axisBand(a);   // the radio's band, or a Kiwi's whole 0 to 30 MHz
+    const double fs = ax.spanMhz;
     static double lastC = 0, lastFs = 0;
-    const double rc = radioCenterMhz(a);   // the axis shows the radio's real centre, so a signal sits at its true frequency
+    const double rc = ax.centreMhz();   // the axis shows the radio's real centre, so a signal sits at its true frequency
     const double bLo = rc - fs / 2, bHi = rc + fs / 2, span = gXHi - gXLo;
-    if (lastFs != fs || !(gXHi > gXLo) || (lastC != rc && span >= lastFs * 0.999)) { gXLo = bLo; gXHi = bHi; }   // a new band, or a view that showed all of the old one
+    if (kiwiWidened(a, fs, lastFs)) {}
+    else if (lastFs != fs || !(gXHi > gXLo) || (lastC != rc && span >= lastFs * 0.999)) { gXLo = bLo; gXHi = bHi; }   // a new band, or a view that showed all of the old one
     else if (lastC != rc) {   // a retune keeps the user's zoom (#238): the same view if the channel is still in it, else the same span around the channel
         const double chan = a.freqMhz;
         double lo = chan >= gXLo && chan <= gXHi ? gXLo : chan - span / 2;
@@ -682,8 +702,9 @@ static void setupFreqAxis(const App& a) {
     plt::SetupAxisSpan(plt::X1, std::min(kFreqSpanMinMhz, fs), fs);   // the wheel stops where the zoom slider does (#425, #442)
 }
 
+// the width the frequency view may take: the radio's rate (a Kiwi's own waterfall: its whole band)
 static double sampleRateMhz(const App& a) {
-    return (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6;
+    return axisBand(a).spanMhz;
 }
 
 static double freqSpanFromZoom(const App& a, float zoom) {
@@ -703,7 +724,7 @@ static float freqZoomFromSpan(const App& a, double spanMhz) {
 
 static void clampFreqViewToBand(const App& a) {
     const double fs = sampleRateMhz(a);
-    const double rc = radioCenterMhz(a);
+    const double rc = axisBand(a).centreMhz();
     const double bLo = rc - fs * 0.5, bHi = rc + fs * 0.5;
     if (!(gXHi > gXLo)) { gXLo = bLo; gXHi = bHi; return; }
     double span = std::min(fs, gXHi - gXLo);
@@ -720,7 +741,7 @@ static void clampFreqViewToBand(const App& a) {
 // The Zoom slider and the zoom keys zoom around the tuned frequency (the VFO), not the middle of the view: it stays in the middle while the
 // span narrows, and the radio's centre does not move (gfx/view_span.h; docs/GENERAL-4.0.md). The wheel over the plots zooms around the mouse.
 static void zoomViewTo(App& a, double spanMhz) {
-    const double fs = sampleRateMhz(a), rc = radioCenterMhz(a);
+    const double fs = sampleRateMhz(a), rc = axisBand(a).centreMhz();
     const viewspan::View v = viewspan::zoomAround(listenMhz(a), spanMhz, rc - fs * 0.5, rc + fs * 0.5);
     gXLo = v.lo; gXHi = v.hi;
     clampFreqViewToBand(a);
@@ -747,7 +768,7 @@ static void followTunerMarker(App& a) {
     lastCentre = centre; lastMarker = a.freqMhz;
     if (!centre || !follow || !(gXHi > gXLo)) { if (!centre) follow = false; return; }
     if (ImGui::IsMouseDown(0)) { follow = false; return; }   // the user took the view
-    const double fs = sampleRateMhz(a), rc = radioCenterMhz(a);
+    const double fs = sampleRateMhz(a), rc = axisBand(a).centreMhz();
     const double k = a.specSmoothZoom ? 1.0 - std::exp(-std::min(0.1, (double)ImGui::GetIO().DeltaTime) * 18.0) : 1.0;
     bool done = false;
     const tunedrag::View v = tunedrag::followMarker(gXLo, gXHi, a.freqMhz, rc - fs / 2, rc + fs / 2, k, done);
@@ -915,10 +936,12 @@ static float cornerPopup(App& a, const char* label, const char* popId, ImVec2 pl
 }
 
 void specFreqViewUpdate(const App& a) {
-    const double fs = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6;
+    kiwiViewFollow(a);
+    const SpecBand ax = axisBand(a);   // the radio's band, or a Kiwi's whole 0 to 30 MHz
+    const double fs = ax.spanMhz;
     static double lastC = 0, lastFs = 0;
-    const double rc = radioCenterMhz(a);
-    if (lastC != rc || lastFs != fs || !(gXHi > gXLo)) { const auto v = tunedrag::viewAfterRetune(gXLo, gXHi, rc, fs, gXHi > gXLo && lastFs == fs); gXLo = v.lo; gXHi = v.hi; }
+    const double rc = ax.centreMhz();
+    if (lastC != rc || lastFs != fs || !(gXHi > gXLo)) { const auto v = tunedrag::viewAfterRetune(gXLo, gXHi, rc, fs, gXHi > gXLo && (lastFs == fs || kiwiWidened(a, fs, lastFs))); gXLo = v.lo; gXHi = v.hi; }
     lastC = rc;
     lastFs = fs;
     const double bLo = rc - fs / 2, bHi = rc + fs / 2;
@@ -932,8 +955,9 @@ void specFreqViewGet(double& loMhz, double& hiMhz) {
 }
 
 void specFreqViewWheel(App& a, float mouseNorm, float wheel, double& loMhz, double& hiMhz) {
-    const double fs = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6;
-    const double rc = radioCenterMhz(a);
+    const SpecBand ax = axisBand(a);
+    const double fs = ax.spanMhz;
+    const double rc = ax.centreMhz();
     const double bLo = rc - fs / 2, bHi = rc + fs / 2;
     loMhz = gXLo;
     hiMhz = gXHi;
@@ -942,7 +966,8 @@ void specFreqViewWheel(App& a, float mouseNorm, float wheel, double& loMhz, doub
     const double span = hiMhz - loMhz;
     const double center = loMhz + mouseNorm * span;
     const double factor = wheel > 0 ? 0.88 : 1.0 / 0.88;
-    double nspan = std::min(fs, std::max(fs / 512.0, span * factor));
+    const double minSpan = kiwiSpecOn(a) ? 0.002 : fs / 512.0;   // a Kiwi's deepest zoom is about 1.8 kHz wide, whatever its whole band
+    double nspan = std::min(fs, std::max(minSpan, span * factor));
     loMhz = center - mouseNorm * nspan;
     hiMhz = loMhz + nspan;
     if (loMhz < bLo) { loMhz = bLo; hiMhz = loMhz + nspan; }
@@ -1718,7 +1743,7 @@ static void extraInputActions(App& a, bool hov) {
             if (pressed(Action::PanLeft, true)) { gXLo -= sp * 0.25; gXHi -= sp * 0.25; clampFreqViewToBand(a); }
             if (pressed(Action::PanRight, true)) { gXLo += sp * 0.25; gXHi += sp * 0.25; clampFreqViewToBand(a); }
         }
-        if (pressed(Action::ZoomReset)) { const double fs = sampleRateMhz(a), rc = radioCenterMhz(a); gXLo = rc - fs / 2; gXHi = rc + fs / 2; }
+        if (pressed(Action::ZoomReset)) { const double fs = sampleRateMhz(a), rc = axisBand(a).centreMhz(); gXLo = rc - fs / 2; gXHi = rc + fs / 2; }
         if (pressed(Action::WfPause)) a.wf.paused = !a.wf.paused;
     }
 }
@@ -1737,10 +1762,12 @@ static double gBinsPerPx = 1;   // FFT bins per pixel column of the spectrum as 
 double specBinsPerPixel() { return gBinsPerPx; }
 
 static void spectrumPlot(App& a, ImVec2 size, int extraFlags) {
-    const bool dbm = a.specDbm;
+    const bool kiwi = kiwiSpecOn(a);   // a Kiwi's own waterfall: its levels are dBm per Kiwi bin (the radio's dBm offset was taken off in ingest)
+    const bool dbm = a.specDbm || kiwi;
     const float dbmOff = dbm ? dbmOffset(a) : 0.f;
-    const char* const kYLabel = dbm ? (a.specPerHz ? tr("power (dBm/Hz)") : tr("power (dBm/bin)")) : (a.specPerHz ? tr("power (dBFS/Hz)") : tr("power (dBFS/bin)"));
-    const char* const kUnit = dbm ? (a.specPerHz ? "dBm/Hz" : "dBm") : (a.specPerHz ? "dBFS/Hz" : "dBFS");   // the readouts name the unit too
+    const bool perHz = a.specPerHz && !kiwi;
+    const char* const kYLabel = dbm ? (perHz ? tr("power (dBm/Hz)") : tr("power (dBm/bin)")) : (perHz ? tr("power (dBFS/Hz)") : tr("power (dBFS/bin)"));
+    const char* const kUnit = dbm ? (perHz ? "dBm/Hz" : "dBm") : (perHz ? "dBFS/Hz" : "dBFS");   // the readouts name the unit too
     ImVec2 plotMin, plotSize;
     bool drawn = false, openCtx = false;
     double visLo = 0, visHi = 0;
@@ -1783,7 +1810,8 @@ static void spectrumPlot(App& a, ImVec2 size, int extraFlags) {
             if (std::fabs(lim.Y.Min - a.yMin) > 0.01 || std::fabs(lim.Y.Max - a.yMax) > 0.01) {
                 a.yMin = setMin = (float)lim.Y.Min; a.yMax = setMax = (float)lim.Y.Max; a.specAutoDb = false;
                 if (!ImGui::IsMouseDown(ImGuiMouseButton_Left) && !a.smooth.empty()) {   // a wheel zoom does not lose the trace (#425); a drag is deliberate. a.yMin moved away from setMin: the next frame applies it
-                    const double fsM = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6, x0M = radioCenterMhz(a) - fsM / 2, dxM = fsM / (double)a.smooth.size();
+                    const SpecBand sb = specBand(a);
+                    const double fsM = sb.spanMhz, x0M = sb.firstMhz(a.smooth.size()), dxM = fsM / (double)a.smooth.size();
                     const size_t i0 = (size_t)std::max(0.0, std::floor((lim.X.Min - x0M) / dxM)), i1 = (size_t)std::min((double)a.smooth.size(), std::ceil((lim.X.Max - x0M) / dxM));
                     float tLo = 1e9f, tHi = -1e9f;
                     for (size_t i = i0; i < i1; i++) if (std::isfinite(a.smooth[i])) { tLo = std::min(tLo, a.smooth[i]); tHi = std::max(tHi, a.smooth[i]); }
@@ -1796,8 +1824,9 @@ static void spectrumPlot(App& a, ImVec2 size, int extraFlags) {
             const size_t nb = a.smooth.size();
             const plt::Rect vis = plt::GetPlotLimits();
             const int wpx = std::max(1, (int)plotSize.x);
-            const double fsMhz = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6, rc = radioCenterMhz(a);
-            const double x0 = rc - fsMhz / 2, dx = fsMhz / (double)nb;   // bin i sits at x0 + i * dx (the same positions xs() lists)
+            const SpecBand sb = specBand(a);   // the radio's band, or the band of a Kiwi's own waterfall frame
+            const double fsMhz = sb.spanMhz, rc = radioCenterMhz(a);
+            const double x0 = sb.firstMhz(nb), dx = fsMhz / (double)nb;   // bin i sits at x0 + i * dx (the same positions xs() lists)
             const bool lightBg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg).x > 0.6f;
             const float* tc = cmap::traceRgb(a.traceColor, lightBg);   // the preset: soft white (dark grey on a light background) unless chosen
             const ImVec4 trc(tc[0], tc[1], tc[2], 1.f);
@@ -2097,10 +2126,10 @@ static void waterfallPlot(App& a, ImVec2 size, int extraFlags) {
     if (plt::BeginPlot("##wf", size, plt::Flags_NoLegend | plt::Flags_NoTitle | plt::Flags_Overlay | plt::Flags_NoDoubleReset | (a.specSmoothZoom ? plt::Flags_SmoothZoom : 0) | extraFlags | ((isGeneralFamily(a.family) && generalDragging(1)) || bandEdgeDragging(1) || fileBoxDragging(1) ? plt::Flags_NoPan : 0) | (a.identifyTool ? plt::Flags_NoPan : 0) | (ImGui::GetIO().KeyShift ? plt::Flags_NoDrag : 0))) {
         drawn = true;
         plt::SetupAxes(nullptr, a.wf.clockLabels ? tr("time of day") : tr("seconds ago"), plt::AxisFlags_NoTickLabels | (a.specGrid ? 0 : plt::AxisFlags_NoGridLines), plt::AxisFlags_Inside | (a.specGrid ? 0 : plt::AxisFlags_NoGridLines));   // the spectrum above shows the frequencies
-        double fs = (a.engine.sampleRate() > 0 ? a.engine.sampleRate() : a.tune.sampleRate) / 1e6;
-        const double rc = radioCenterMhz(a);
-        // the picture starts half a bin left of the band edge, so each bin's colour sits under the trace point of that bin (#270)
-        const double x0 = specaxis::imageLo(rc, fs, a.wf.fast() && a.wf.fastBins ? a.wf.fastBins : a.smooth.empty() ? (size_t)a.wf.cols : a.smooth.size()), x1 = x0 + fs;
+        const SpecBand sb = specBand(a);   // the rows' band: the radio's, or a Kiwi's own waterfall frame's
+        double fs = sb.spanMhz;
+        // the picture starts half a bin left of the first bin's centre, so each bin's colour sits under the trace point of that bin (#270)
+        const double x0 = sb.imageLoMhz(a.wf.fast() && a.wf.fastBins && !kiwiSpecOn(a) ? a.wf.fastBins : a.smooth.empty() ? (size_t)a.wf.cols : a.smooth.size()), x1 = x0 + fs;
         setupFreqAxis(a);
         // y is in rows, so the picture keeps its size while the measured row time wanders; the labels are the fixed scale above.
         // Paused, the view is free to scroll and zoom back through the rows (but not past the oldest or the newest), with ordinary tick labels.
@@ -2225,7 +2254,8 @@ void spectrumWaterfall(App& a, float& frac, bool drag) {
     if (wfFirst) { wfPart(); specPart(); } else { specPart(); wfPart(); }
     if (isGeneralFamily(a.family)) generalVfoMenu(a);   // a right click on the VFO band: the demodulators and the filter presets
     {   // the part of the band in view: the auto ranges follow its noise floor (a zoom onto a crowded part keeps its own floor dark)
-        const double fsM = sampleRateMhz(a), lo = radioCenterMhz(a) - fsM / 2;
+        const SpecBand sb = specBand(a);
+        const double fsM = sb.spanMhz, lo = sb.loMhz;
         if (fsM > 0 && gXHi > gXLo) { a.wf.viewU0 = (gXLo - lo) / fsM; a.wf.viewU1 = (gXHi - lo) / fsM; }
     }
     ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x, y), ImVec2(p.x + w, y), hot ? IM_COL32(200, 200, 200, 160) : IM_COL32(110, 110, 110, 110), hot ? 2.f : 1.f);

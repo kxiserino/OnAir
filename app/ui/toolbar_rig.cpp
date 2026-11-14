@@ -118,6 +118,8 @@ static void netRadioList(App& a) {
             const KiwiStatus ks = kiwiStatus(netRadioHostPort(a.netRadios[i]));
             if (ks.connected) { ImGui::SameLine(); ImGui::TextDisabled(tr("S-meter %.0f dBm%s"), ks.rssiDbm, ks.adcOverload ? tr(", ADC overload") : ""); }
             else if (!ks.message.empty()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.25f, 1), "%s", ks.message.c_str()); }
+            if (ks.connected && ks.wfConnected) { ImGui::SameLine(); ImGui::TextDisabled("%s", tr(", the Kiwi's waterfall")); }
+            else if (ks.connected && !ks.wfMessage.empty()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(0.95f, 0.78f, 0.25f, 1), "%s", (std::string(tr("waterfall: ")) + ks.wfMessage).c_str()); }
         }
         ImGui::PopID();
     }

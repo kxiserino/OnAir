@@ -23,8 +23,24 @@ By the code (not run against a live Kiwi): modes with a minimum rate up to 252 k
 FST4, MSK144 off the HF bands, RTTY, SSTV, PSK, Olivia and the other keyboard modes, FreeDV, HamDRM), CW, PSK, JS8, HFDL, ALE, the general receiver (AM, SSB, CW, NFM
 in a window of 12 kHz) and the AM broadcast entry. A Kiwi's 12 kHz window cannot hold: HF beacons across a band (they need megahertz), wide modes, and
 anything above 30 MHz. DRM: the Kiwi has its own DRM extension; OnAir does not use it and its DRM mode wants a wider capture, so DRM from a Kiwi is not
-offered. The spectrum and waterfall in OnAir show the 12 kHz around the tuned frequency (the 0 to 30 MHz waterfall of the Kiwi is not shown; its frame
-layout is parsed and tested, nothing connects to it).
+offered.
+
+## The spectrum and waterfall
+
+The spectrum and waterfall come from the **Kiwi's own waterfall** (the setting "Kiwi's own waterfall", on by default), as on the Kiwi's web page: the
+Kiwi computes 1024 levels over the part of its 0 to 30 MHz you look at, so the picture is sharp at every zoom, from the whole HF band down to about
+2 kHz. Zoom out (wheel, the Zoom slider, the zoom keys) past the 12 kHz of IQ and keep going to the whole band; pan anywhere in it; a click outside the
+IQ retunes the Kiwi there, as with any radio. OnAir asks the Kiwi for the zoom that covers the view (span 30 MHz / 2^zoom, zoom 0 to 14) and its
+centre, at most ten times a second, and only when the view moved by a bin or more. A new zoom starts the waterfall's rows again; a pan moves them along.
+
+The levels are the Kiwi's dBm (the owner's calibration, `wf_cal`, applied); with a dBm offset set for the radio (Spectrum menu) they show as the Kiwi
+reports them. The meters, the decoders and the automatic bandwidth still use the 12 kHz of IQ. The waterfall is a second connection to the Kiwi
+(`/kiwi/<the IQ connection's time>/W/F`), the way the Kiwi's page does it, so it uses the same listener slot. The Kiwi ties the two together: when
+the waterfall connection closes, it ends the IQ session too. So OnAir opens the waterfall with the IQ connection and closes it only with it (turning
+the setting on or off reconnects the radio). A Kiwi has fewer waterfalls than receivers (often 2 or 3 for 8, shared): one that sends no waterfall
+lines, or stops, leaves the spectrum and waterfall on the 12 kHz of IQ (after 10 seconds without a line) until the lines come again. A shared
+waterfall sends only a few lines a second and pauses for a few seconds after a new zoom. The Network radios window says which ("the Kiwi's
+waterfall", or why not).
 
 ## Public receivers are somebody's hobby
 
@@ -43,11 +59,18 @@ Read in kiwiclient's sources (protocol facts only; no code was copied): the mess
 GPS block, big-endian 16-bit IQ), the commands (`SET auth`, `SET mod=... low_cut high_cut freq`, `SET agc`, `SET compression=0`, `SET AR OK`, `SET keepalive`,
 `SET ident_user`), the error names (`too_busy`, `badp` 1 to 7, `down`, `redirect`), the W/F frame layout, and the sample_rate message.
 
+The waterfall (W/F) was checked against a live KiwiSDR (v1.902, a public receiver) and read in the KiwiSDR sources (`rx/rx_waterfall.cpp`,
+`web/openwebrx/openwebrx.js`; protocol facts only): `MSG wf_setup` (with `zoom_max`, `wf_cal`) before `SET zoom=Z cf=<kHz>`, `SET maxdb/mindb`,
+`SET wf_speed`, `SET wf_comp=0`, `SET interp=13`; the answer `MSG zoom=Z start=<x_bin>`; each line's x_bin (start Hz = x_bin * bandwidth / (1024 * 2^14)),
+the zoom in the low 16 bits of the flags (compression is bit 16), 1024 levels of 255 + dBm, plus `wf_cal`; the first line at a new zoom is a bright
+row and is dropped; and that closing the W/F connection ends the paired IQ session.
+
 Assumed (marked in `core/src/source/kiwisdr_proto.h`): the path prefix `/kiwi/<time>/SND`; `p=#` for no password; that in IQ mode the tuned frequency is the
 centre of the 12 kHz; I first, Q second (the setting "Swap I and Q" mirrors it if a Kiwi disagrees); the names of the time-limit and kick messages
-(`inactivity_timeout`, `kick_by_admin`); the list's field names and address (below). OnAir was **not tried on a real KiwiSDR**: only against a fake server in
-`tests/source/test_kiwisdr.cpp` (handshake, commands, keepalive, IQ with sequence gaps, short / odd / compressed / oversize frames, busy, bad password,
-down, time limit, reconnect pauses, fuzzed parsers, the list parser, the interpolator).
+(`inactivity_timeout`, `kick_by_admin`); the list's field names and address (below). On a real KiwiSDR (v1.902, a public receiver, from Windows 11) only
+the connection, the IQ stream and the waterfall were tried, in the Shortwave mode; the IQ demodulation itself, the time limit and the busy and password
+answers were not. The rest is tested against a fake server in `tests/source/test_kiwisdr.cpp` (handshake, commands, keepalive, IQ with sequence gaps, short / odd / compressed / oversize frames, busy, bad password,
+down, time limit, reconnect pauses, fuzzed parsers, the list parser, the interpolator, the waterfall's connection, view commands, band and levels).
 
 ## The public list
 
