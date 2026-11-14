@@ -7,6 +7,7 @@
 #include "ui/kit/mode_panel.h"
 #include "ui/kit/mode_frame.h"
 #include "ui/kit/session_list.h"
+#include "dect2/acars/acars_readable.h"
 #include "dect2/aero/aero_tel.h"
 #include "dect2/audio/audioout.h"
 #include <algorithm>
@@ -30,6 +31,7 @@ struct State {
     char fLabel[8] = "";                 // filter: label starts with this
     char fReg[16] = "";                  // filter: registration, flight or AES address contains this
     bool badToo = false;                 // also show messages whose block check failed
+    bool readable = false;               // only text a person reads (dect2/acars/acars_readable.h)
     double selectedTime = -1;
     adsbmap::View map;
     bool mapFollow = true;               // the map fits the aircraft until the user moves it
@@ -168,6 +170,7 @@ bool passes(const dect2::AeroMessage& m) {
     if (!m.crcOk && !S.badToo) return false;
     if (S.fLabel[0] && lower(m.label).rfind(lower(S.fLabel), 0) != 0) return false;
     if (S.fReg[0] && !contains(m.registration, S.fReg) && !contains(m.flight, S.fReg) && !contains(aes(m.aesId), S.fReg)) return false;
+    if (S.readable && !dect2::acarsReadable(m.label, m.text)) return false;
     return true;
 }
 
@@ -183,6 +186,10 @@ void filterRow() {
     flowNext(12 * gUi);
     ImGui::Checkbox("with failed check", &S.badToo);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Also list messages whose ACARS block check or parity failed.");
+    flowNext(12 * gUi);
+    ImGui::Checkbox("readable text only", &S.readable);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Only text a person wrote or reads (free text, weather, operations notes): no ADS-C, CPDLC, FMS and datalink data, "
+                                                  "encrypted blocks or acknowledgements. About 1 message in 100 on a P channel.");
     flowEnd();   // the filters wrap in a narrow tab
 }
 
