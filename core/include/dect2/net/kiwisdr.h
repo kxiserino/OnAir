@@ -17,9 +17,28 @@ struct KiwiStatus {
     uint64_t frames = 0, gapFrames = 0, badFrames = 0;
     std::string message;          // the reason it is not streaming (busy, bad password, time limit ...) or a note, in plain words; "" when all is well
     std::string version;          // "1.8xx" when the server said it
+    bool wfConnected = false;     // the Kiwi's own waterfall stream (W/F) is running
+    std::string wfMessage;        // why it is not (no free waterfall, refused ...); "" when all is well or not wanted
 };
 // The status of the receiver at host:port (the nativeArgs of its device entry); a default KiwiStatus when unknown.
 KiwiStatus kiwiStatus(const std::string& hostPort);
+
+// ---- the Kiwi's own waterfall -------------------------------------------------------------------------------------------------------------
+// Besides the 12 kHz of IQ, a Kiwi computes a spectrum of its whole band (0 to 30 MHz) at a zoom of the client's choice: 1024 levels over
+// bandwidth / 2^zoom, a few dozen times a second. The source keeps a second connection for it (the same listener slot) while the app asks for a view.
+struct KiwiSpectrum {
+    std::vector<float> dbm;        // the levels in dBm (the Kiwi page's scale, the owner's calibration applied); bin k is centred on startHz + (k + 0.5) * binHz
+    double startHz = 0, binHz = 0;
+    double bandwidthHz = 30e6;     // the band the receiver covers: 0 .. bandwidthHz
+    int zoom = 0;
+    uint64_t seq = 0;              // counts the frames of the receiver; 0: none yet
+    double spanHz() const { return binHz * (double)dbm.size(); }
+};
+// The newest frame of the receiver at host:port; false when there is none newer than lastSeq
+bool kiwiSpectrum(const std::string& hostPort, KiwiSpectrum& out, uint64_t lastSeq);
+// The band the screen shows (Hz). The source asks the Kiwi for the zoom and centre that cover it; spanHz 0: no waterfall wanted (the
+// connection is closed, the Kiwi's waterfall slot given back)
+void kiwiSetSpectrumView(const std::string& hostPort, double centreHz, double spanHz);
 
 // GPS time of a Kiwi frame (seconds of the GPS week) to a Unix time: the week is taken from `nowUnix` (the computer's clock, only used to pick the
 // week), leap seconds since 1980 are applied (18 s since 2017). Returns -1 for a status of no solution.

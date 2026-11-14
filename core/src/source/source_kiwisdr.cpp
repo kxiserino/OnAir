@@ -5,7 +5,9 @@
 // Protocol: see the facts and their VERIFIED / ASSUMED marks in kiwisdr_proto.h. Public Kiwis are somebody's hobby: one connection per radio, a
 // keepalive every second (what the official page does), SET ident_user=OnAir so the owner sees who listens, and a growing pause (5 s .. 2 min,
 // a minute at least after "busy" or a time limit) before every new connection after one was lost. A first connection that fails is not repeated.
-// Not tested against a real KiwiSDR: only against a fake one in tests/source/test_kiwisdr.cpp.
+// The Kiwi's own waterfall (W/F, 1024 levels over the part of 0 to 30 MHz the app shows) runs on a second connection and thread while the app
+// asks for a view (kiwiSetSpectrumView); its frames go to the app through kiwiSpectrum(), not through the samples (dect2/net/kiwisdr.h).
+// Tested against a fake KiwiSDR in tests/source/test_kiwisdr.cpp; on a real one (v1.902) only the connection, the IQ stream and the waterfall.
 #include "../net/tcp_client.h"
 #include "../net/ws_client.h"
 #include "kiwisdr_proto.h"
@@ -27,6 +29,9 @@ std::mutex gKiwiMu;
 std::map<std::string, KiwiStatus> gStatus;
 std::map<std::string, std::string> gPass;
 std::atomic<int> gBackMin{5000}, gBackMax{120000}, gStallMs{8000};
+// the waterfall of each receiver: the newest frame from the source, the view the app asks for (viewGen counts its changes)
+struct WfShared { KiwiSpectrum frame; double viewC = 0, viewSpan = 0; uint64_t viewGen = 0; };
+std::map<std::string, WfShared> gWf;
 
 void noteStatus(const std::string& a, const std::function<void(KiwiStatus&)>& f) { std::lock_guard<std::mutex> lk(gKiwiMu); f(gStatus[a]); }
 std::string passFor(const std::string& a) { std::lock_guard<std::mutex> lk(gKiwiMu); auto it = gPass.find(a); return it == gPass.end() ? std::string() : it->second; }
@@ -34,6 +39,21 @@ std::string passFor(const std::string& a) { std::lock_guard<std::mutex> lk(gKiwi
 
 KiwiStatus kiwiStatus(const std::string& hp) { std::lock_guard<std::mutex> lk(gKiwiMu); auto it = gStatus.find(hp); return it == gStatus.end() ? KiwiStatus() : it->second; }
 void kiwiSetPassword(const std::string& hp, const std::string& pw) { std::lock_guard<std::mutex> lk(gKiwiMu); if (pw.empty()) gPass.erase(hp); else gPass[hp] = pw; }
+
+bool kiwiSpectrum(const std::string& hp, KiwiSpectrum& out, uint64_t lastSeq) {
+    std::lock_guard<std::mutex> lk(gKiwiMu);
+    auto it = gWf.find(hp);
+    if (it == gWf.end() || it->second.frame.seq <= lastSeq || it->second.frame.dbm.empty()) return false;
+    out = it->second.frame;
+    return true;
+}
+void kiwiSetSpectrumView(const std::string& hp, double centreHz, double spanHz) {
+    std::lock_guard<std::mutex> lk(gKiwiMu);
+    WfShared& w = gWf[hp];
+    if (spanHz < 0 || !std::isfinite(spanHz) || !std::isfinite(centreHz)) spanHz = 0;
+    if (w.viewC == centreHz && w.viewSpan == spanHz) return;
+    w.viewC = centreHz; w.viewSpan = spanHz; w.viewGen++;
+}
 
 double kiwiGpsToUnix(uint32_t gpsSec, uint32_t gpsNsec, double nowUnix, int leap) {
     constexpr double kGpsEpoch = 315964800.0, kWeek = 604800.0;
@@ -103,7 +123,9 @@ bool splitHostPort(const std::string& a, std::string& host, int& port) {
 struct KiwiInfo { std::string version; double maxHz = kMaxFreq; double sampleRate = 0; bool gotRate = false, gotAuth = false; };
 
 // connection, upgrade, auth, then the server's first messages up to sample_rate. why/err say what went wrong.
-bool connectAndAuth(WsClient& ws, const std::string& host, int port, const std::string& pw, int timeoutMs, KiwiInfo& info, Why& why, std::string& err) {
+// ts: the time stamp in the path; the waterfall connection uses the same one, so the Kiwi counts both as one listener
+bool connectAndAuth(WsClient& ws, const std::string& host, int port, const std::string& pw, int timeoutMs, KiwiInfo& info, Why& why, std::string& err,
+                    long long ts = (long long)std::time(nullptr)) {
     const std::string addr = (host.find(':') != std::string::npos ? "[" + host + "]" : host) + ":" + std::to_string(port);
     why = Why::Net;
     const sock_t s = tcpConnect(host, port, timeoutMs, err);
@@ -111,7 +133,7 @@ bool connectAndAuth(WsClient& ws, const std::string& host, int port, const std::
     ws.attach(s);
     sockRecvTimeout(s, kAnswerMs);
     std::string e;
-    const std::string path = "/kiwi/" + std::to_string((long long)std::time(nullptr)) + "/SND";
+    const std::string path = "/kiwi/" + std::to_string(ts) + "/SND";
     if (!ws.handshake(host, port, path, e)) { err = addr + ": " + e + " (is it a KiwiSDR? the default port is 8073)"; return false; }
     if (!ws.sendText(kiwi::authCmd(pw))) { err = "the connection to " + addr + " dropped"; return false; }
     std::vector<unsigned char> m;
@@ -182,7 +204,8 @@ protected:
         KiwiInfo info;
         Why why = Why::None;
         std::string e;
-        if (!connectAndAuth(ws_, host, port, passFor(addr_), kConnectMs, info, why, e)) {
+        const long long ts = (long long)std::time(nullptr);
+        if (!connectAndAuth(ws_, host, port, passFor(addr_), kConnectMs, info, why, e, ts)) {
             closeWs(ws_);
             err = "KiwiSDR: " + e;
             lastReason_ = err;
@@ -217,6 +240,7 @@ protected:
         lastReason_.clear();
         streamStart_ = now;
         established_ = true;
+        if (radioFlag(s, "kiwiwf", true)) startWf(host, port, ts);   // the Kiwi's own waterfall, paired with this IQ connection
         return true;
     }
 
@@ -247,11 +271,17 @@ protected:
     }
 
     void closeDevice() override {
+        stopWf();
         closeWs(ws_);
         noteStatus(addr_, [](KiwiStatus& st) { st.connected = false; });
     }
     bool restartForRate() const override { return false; }
-    void interrupt() override { if (ws_.sock() != kBadSock) sockShutdown(ws_.sock()); }
+    void interrupt() override {
+        if (ws_.sock() != kBadSock) sockShutdown(ws_.sock());
+        wfRun_ = false;   // a stop, not a loss: the waterfall thread ends without a message (closeDevice joins it)
+        std::lock_guard<std::mutex> lk(wfSockMu_);
+        if (wfWs_.sock() != kBadSock) sockShutdown(wfWs_.sock());
+    }
 
     void streamLoop() override {
         std::vector<unsigned char> m;
@@ -348,6 +378,111 @@ protected:
     }
 
 private:
+    // ---- the waterfall (W/F): its own connection and thread, opened with the IQ connection and closed with it ----------------------------
+    // The Kiwi pairs the two by the time stamp in their paths, and ends the IQ session when the W/F connection closes (checked on a live Kiwi,
+    // v1.902): so the W/F connection is never closed on its own. Without a view it only sends keepalives; frames that stop or never come leave
+    // the app on the IQ's own spectrum (it falls back after 3 s) until they come again.
+    void startWf(const std::string& host, int port, long long ts) {
+        stopWf();
+        wfRun_ = true;
+        wfTh_ = namedThread("onair-kiwi-wf", [this, host, port, ts] {
+            std::string err;
+            wfSession(host, port, ts, err);
+            if (wfRun_ && !err.empty()) { fprintf(stderr, "KiwiSDR waterfall: %s\n", err.c_str()); fflush(stderr); }
+            noteStatus(addr_, [&](KiwiStatus& st) { st.wfConnected = false; st.wfMessage = wfRun_ ? err : std::string(); });
+        });
+    }
+    void stopWf() {
+        wfRun_ = false;
+        { std::lock_guard<std::mutex> lk(wfSockMu_); if (wfWs_.sock() != kBadSock) sockShutdown(wfWs_.sock()); }
+        if (wfTh_.joinable()) wfTh_.join();
+    }
+    bool wfView(double& c, double& span, uint64_t& gen) {
+        std::lock_guard<std::mutex> lk(gKiwiMu);
+        const WfShared& w = gWf[addr_];
+        c = w.viewC; span = w.viewSpan; gen = w.viewGen;
+        return span > 0;
+    }
+    // One W/F connection, until the source stops it (wfRun_) or the Kiwi ends it; err says why it ended otherwise
+    void wfSession(const std::string& host, int port, long long ts, std::string& err) {
+        const sock_t s = tcpConnect(host, port, kConnectMs, err);
+        if (s == kBadSock) { err = "cannot connect: " + err; return; }
+        { std::lock_guard<std::mutex> lk(wfSockMu_); wfWs_.attach(s); }
+        struct Closer { KiwiSource* k; ~Closer() { std::lock_guard<std::mutex> lk(k->wfSockMu_); closeWs(k->wfWs_); } } closer{this};
+        if (!wfRun_) return;
+        sockRecvTimeout(s, kAnswerMs);   // the upgrade through a Kiwi proxy (*.proxy.kiwisdr.com) can take a second
+        if (!wfWs_.handshake(host, port, "/kiwi/" + std::to_string(ts) + "/W/F", err)) return;
+        sockRecvTimeout(s, 250);   // then short reads: the view and the keepalive go out between them
+        if (!wfWs_.sendText(kiwi::authCmd(passFor(addr_)))) { err = "the connection dropped"; return; }
+        std::vector<unsigned char> m;
+        std::vector<std::pair<std::string, std::string>> kv;
+        std::vector<float> db;
+        double bw = maxHz_ > 1e6 ? maxHz_ : kMaxFreq;
+        int zoomMax = kiwi::kWfMaxZoom, cal = 0;
+        bool setup = false, flowing = false;
+        uint64_t sentGen = 0;
+        int sentZoom = -1, lastZoom = -1;
+        long long sentBin = -1;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto lastKeep = t0, lastFrame = t0, lastCmd = t0 - std::chrono::seconds(1);
+        while (wfRun_) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastKeep >= std::chrono::milliseconds(kKeepaliveMs)) { if (!wfWs_.sendText("SET keepalive")) { err = "the connection dropped"; return; } lastKeep = now; }
+            double c, span; uint64_t gen;
+            if (setup && wfView(c, span, gen) && gen != sentGen && now - lastCmd >= std::chrono::milliseconds(100)) {   // at most ten view changes a second (a drag sends many)
+                const int z = kiwi::wfZoomFor(span, bw, zoomMax);
+                const double cf = kiwi::wfClampCentre(c, z, bw);
+                const long long bin = std::llround(cf / (kiwi::wfSpanHz(z, bw) / kiwi::kWfBins));   // a view that moved less than a bin is not sent again
+                if (z != sentZoom || bin != sentBin) {
+                    if (!wfWs_.sendText(kiwi::wfViewCmd(z, cf))) { err = "the connection dropped"; return; }
+                    sentZoom = z; sentBin = bin;
+                }
+                sentGen = gen; lastCmd = now;
+            }
+            if (now - lastFrame > std::chrono::seconds(8) && (flowing || now - t0 > std::chrono::seconds(8))) {   // told, not closed (that would end the IQ too)
+                flowing = false; lastFrame = now;
+                const std::string why = setup ? "no waterfall from the KiwiSDR (all of its waterfalls may be in use)" : "the KiwiSDR did not set up a waterfall";
+                noteStatus(addr_, [&](KiwiStatus& st) { st.wfConnected = false; st.wfMessage = why; });
+            }
+            const auto kind = wfWs_.readMessage(m, kMaxMessage);
+            if (kind == WsClient::Kind::Timeout) continue;
+            if (kind == WsClient::Kind::Closed) { err = "the KiwiSDR closed the waterfall connection"; return; }
+            if (kind == WsClient::Kind::Bad) { err = "bad data on the waterfall connection"; return; }
+            if (kind != WsClient::Kind::Binary) continue;
+            if (kiwi::parseMsg(m.data(), m.size(), kv)) {
+                for (const auto& p : kv) {
+                    std::string text;
+                    if (classify(p.first, p.second, text) != Why::None) { err = text; return; }
+                    if (p.first == "bandwidth") { const double b = atof(p.second.c_str()); if (b > 1e6 && b < 1e9) bw = b; }
+                    else if (p.first == "zoom_max") zoomMax = std::min(std::max(atoi(p.second.c_str()), 0), kiwi::kWfMaxZoom);
+                    else if (p.first == "wf_cal") cal = atoi(p.second.c_str());
+                    else if (p.first == "wf_setup" && !setup) {   // the Kiwi page's set-up; maxdb/mindb are required but do not change the levels sent
+                        setup = wfWs_.sendText("SET maxdb=0 mindb=-100") && wfWs_.sendText("SET wf_speed=4") && wfWs_.sendText("SET wf_comp=0") && wfWs_.sendText("SET interp=13");
+                        if (!setup) { err = "the connection dropped"; return; }
+                        sentGen = 0; sentZoom = -1;   // the view goes out at once
+                    }
+                }
+                continue;
+            }
+            kiwi::Wf wf;
+            if (!kiwi::parseWf(m.data(), m.size(), wf) || wf.pixels == 0 || wf.pixels > 4 * kiwi::kWfBins || (wf.flagsZoom & kiwi::kWfCompressed)) continue;
+            if (wf.zoom() != lastZoom) { lastZoom = wf.zoom(); continue; }   // the first line at a new zoom is a bright row across the waterfall (live Kiwi; kiwiclient skips them too)
+            db.resize(wf.pixels);
+            kiwi::wfToDbm(m.data() + wf.pixOff, wf.pixels, cal, db.data());
+            const double startHz = kiwi::wfStartHz(wf.xBin, bw), binHz = kiwi::wfSpanHz(wf.zoom(), bw) / (double)wf.pixels;
+            {
+                std::lock_guard<std::mutex> lk(gKiwiMu);
+                KiwiSpectrum& f = gWf[addr_].frame;
+                f.dbm.swap(db);
+                f.startHz = startHz; f.binHz = binHz; f.bandwidthHz = bw; f.zoom = wf.zoom();
+                f.seq++;
+            }
+            if (!flowing) noteStatus(addr_, [](KiwiStatus& st) { st.wfConnected = true; st.wfMessage.clear(); });
+            flowing = true;
+            lastFrame = now;
+        }
+    }
+
     static double offsetOf(const TuneSettings& s) {
         auto it = s.radio.find("tune_offset_hz");
         return it == s.radio.end() ? 0.0 : atof(it->second.c_str());
@@ -382,6 +517,10 @@ private:
     int backoff_ = 0;
     std::string lastReason_;
     std::chrono::steady_clock::time_point nextTry_{}, lastKeep_{}, streamStart_{}, lostAt_{};
+    WsClient wfWs_;
+    std::mutex wfSockMu_;   // wfWs_'s socket: attached and closed by the waterfall thread, shut down from stop()
+    std::thread wfTh_;
+    std::atomic<bool> wfRun_{false};
 };
 
 static void setCaps(DeviceInfo& d) {
@@ -397,6 +536,9 @@ static void setCaps(DeviceInfo& d) {
     d.settings.push_back(choiceSetting("agc", "Gain control", "Automatic gain (the Kiwi's AGC), or the manual gain set by the gain slider (0 to 120 dB in the Kiwi's own scale).",
                                        {"auto", "manual"}, {"AGC", "Manual (gain slider)"}, "auto"));
     d.settings.push_back(boolSetting("swapiq", "Swap I and Q", "Mirrors the spectrum. Turn on if signals that should be on the upper side of the frequency appear on the lower side."));
+    d.settings.push_back(boolSetting("kiwiwf", "Kiwi's own waterfall",
+                                     "The spectrum and waterfall come from the KiwiSDR's own waterfall stream: the whole 0 to 30 MHz, zoomed and panned like the Kiwi's web page, "
+                                     "instead of the 12 kHz of IQ. Uses the same listener slot. Off: the spectrum of the IQ only. A change reconnects the radio.", true, true));
 }
 
 DeviceInfo kiwiSdrDevice(const std::string& host, int port) {

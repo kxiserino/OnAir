@@ -84,7 +84,7 @@ struct Fake {
         th = std::thread([this] { loop(); });
         return true;
     }
-    void stop() { run = false; if (th.joinable()) th.join(); if (ls != kBadSock) sockClose(ls); }
+    void stop() { run = false; if (th.joinable()) th.join(); for (auto& w : wfThreads) if (w.joinable()) w.join(); if (ls != kBadSock) sockClose(ls); }
 
     static void wsSend(sock_t c, int op, const std::string& p) {
         std::string f;
@@ -108,6 +108,56 @@ struct Fake {
         return true;
     }
 
+    // the waterfall connection (/kiwi/<time>/W/F): beside the SND one, as on a real Kiwi
+    std::vector<std::thread> wfThreads;   // every connection's thread (joined at stop)
+    std::vector<std::string> wfLog;
+    std::string wfPath;
+    std::atomic<int> wfClosed{0};
+    static constexpr double kWfToneHz = 7.1e6;   // the one strong signal of the fake waterfall
+    bool wfHas(const std::string& l) { std::lock_guard<std::mutex> lk(mu); for (auto& x : wfLog) if (x == l) return true; return false; }
+    int wfCount(const std::string& p) { std::lock_guard<std::mutex> lk(mu); int n = 0; for (auto& x : wfLog) n += x.compare(0, p.size(), p) == 0; return n; }
+    void serveWf(sock_t c) {
+        int zoom = -1; uint32_t xbin = 0, seq = 0;
+        const double bw = 30e6, deep = bw / (1024.0 * 16384.0);   // Hz per x_bin step
+        while (run) {
+            if (zoom >= 0) {   // a line: level 100 everywhere, 200 in the bin of the tone (a real Kiwi: 255 + dBm)
+                std::string f = "W/F";
+                f += (char)0;
+                for (uint32_t v : {xbin, (uint32_t)zoom, seq++}) for (int b = 0; b < 4; b++) f += (char)(v >> (8 * b) & 255);
+                std::string px(1024, (char)100);
+                const double start = xbin * deep, bin = bw / (double)(1u << zoom) / 1024.0;
+                const long long k = (long long)std::floor((kWfToneHz - start) / bin);
+                if (k >= 0 && k < 1024) px[(size_t)k] = (char)200;
+                wsSend(c, 2, f + px);
+            }
+            unsigned char h[2];
+            if (!rd(c, h, 2, true)) { if (!run) break; if (sockPeekClosed(c) == 0) break; continue; }
+            const int op = h[0] & 15;
+            size_t len = h[1] & 127;
+            if (len == 126) { unsigned char x[2]; if (!rd(c, x, 2, false)) break; len = x[0] << 8 | x[1]; }
+            unsigned char m[4];
+            if (!rd(c, m, 4, false)) break;
+            std::string p(len, 0);
+            if (len && !rd(c, &p[0], len, false)) break;
+            for (size_t i = 0; i < len; i++) p[i] ^= m[i & 3];
+            if (op == 8) break;
+            if (op != 1) continue;
+            { std::lock_guard<std::mutex> lk(mu); wfLog.push_back(p); }
+            if (p.compare(0, 8, "SET auth") == 0) {
+                wsSend(c, 2, msgFrame("center_freq=15000000 bandwidth=30000000"));
+                wsSend(c, 2, msgFrame("wf_fft_size=1024 wf_fps=23 wf_fps_max=23 zoom_max=14 rx_chans=8 wf_chans=3 wf_cal=-13 wf_setup"));
+            } else if (p.compare(0, 9, "SET zoom=") == 0) {
+                const int z = atoi(p.c_str() + 9);
+                const size_t cfp = p.find("cf=");
+                if (z < 0 || z > 14 || cfp == std::string::npos) continue;
+                const double cf = atof(p.c_str() + cfp + 3) * 1e3, span = bw / (double)(1u << z);
+                zoom = z; xbin = (uint32_t)std::llround((cf - span / 2) / deep);
+                wsSend(c, 2, msgFrame("zoom=" + std::to_string(z) + " start=" + std::to_string(xbin)));
+            }
+        }
+        wfClosed++;
+    }
+
     void serve(sock_t c) {
         sockRecvTimeout(c, 20);
         std::string head;
@@ -117,10 +167,22 @@ struct Fake {
             head += ch;
             if (head.size() >= 4 && head.compare(head.size() - 4, 4, "\r\n\r\n") == 0) break;
         }
+        const bool isWf = head.find("/W/F ") != std::string::npos;
+        if (!isWf) connections++;   // the waterfall is not counted: the checks of reconnects count the IQ connections
         if (mode == Plain) { const char* g = "HTTP/1.1 404 Not Found\r\n\r\n"; sockSendAll(c, g, strlen(g)); return; }
         const size_t k = head.find("Sec-WebSocket-Key: ");
         if (k == std::string::npos) return;
-        { std::lock_guard<std::mutex> lk(mu); path = head.substr(4, head.find(' ', 4) - 4); }
+        const std::string reqPath = head.substr(4, head.find(' ', 4) - 4);
+        if (isWf) {   // the waterfall: beside the SND one
+            const std::string key = head.substr(k + 19, head.find("\r\n", k) - k - 19);
+            const std::string r = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + wsAcceptKey(key) + "\r\n\r\n";
+            sockSendAll(c, r.data(), r.size());
+            { std::lock_guard<std::mutex> lk(mu); wfPath = reqPath; }
+            serveWf(c);
+            return;
+        }
+        std::lock_guard<std::mutex> one(sndMu);   // one SND connection at a time (a reconnect waits for the old one to end, as the serial fake did)
+        { std::lock_guard<std::mutex> lk(mu); path = reqPath; }
         const std::string key = head.substr(k + 19, head.find("\r\n", k) - k - 19);
         const std::string r = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + wsAcceptKey(key) + "\r\n\r\n";
         sockSendAll(c, r.data(), r.size());
@@ -196,12 +258,10 @@ struct Fake {
             sock_t c = accept(ls, nullptr, nullptr);
             if (c == kBadSock) { std::this_thread::sleep_for(std::chrono::milliseconds(5)); continue; }
             sockSetNonBlocking(c, false);
-            connections++;
-            serve(c);
-            sockShutdown(c);
-            sockClose(c);
+            wfThreads.emplace_back([this, c] { serve(c); sockShutdown(c); sockClose(c); });   // each connection on its own thread: the W/F one comes while SND streams
         }
     }
+    std::mutex sndMu;
 };
 
 static bool readIq(IqRing& ring, std::vector<cf32>& buf) {
@@ -244,6 +304,16 @@ static void pureTests() {
     std::string wf = "W/F" + std::string(1, 'x') + std::string("\x01\0\0\0\x02\0\0\0\x03\0\0\0", 12) + std::string(1024, 'p');
     CHECK(kiwi::parseWf((const unsigned char*)wf.data(), wf.size(), w) && w.xBin == 1 && w.flagsZoom == 2 && w.seq == 3 && w.pixels == 1024);
     CHECK(!kiwi::parseWf((const unsigned char*)wf.data(), 15, w));
+    // the waterfall's band and levels: values a live Kiwi (v1.902) sent for SET zoom=7 cf=7074 (start=3890531, flags 0x7)
+    CHECK(kiwi::parseWf((const unsigned char*)wf.data(), wf.size(), w) && w.zoom() == 2);
+    w.flagsZoom = 0x10007; CHECK(w.zoom() == 7 && (w.flagsZoom & kiwi::kWfCompressed));
+    CHECK(std::fabs(kiwi::wfStartHz(3890531, 30e6) - (7074e3 - 30e6 / 128 / 2)) < 30);   // within a bin of the deepest zoom (1.8 Hz) of cf - span / 2
+    CHECK(std::fabs(kiwi::wfSpanHz(0, 30e6) - 30e6) < 1e-6 && std::fabs(kiwi::wfSpanHz(7, 30e6) - 234375) < 1e-6 && std::fabs(kiwi::wfSpanHz(99, 30e6) - 30e6 / 16384) < 1e-6);
+    CHECK(kiwi::wfZoomFor(252000, 30e6, 14) == 6 && kiwi::wfZoomFor(200000, 30e6, 14) == 7 && kiwi::wfZoomFor(30e6, 30e6, 14) == 0 && kiwi::wfZoomFor(40e6, 30e6, 14) == 0);
+    CHECK(kiwi::wfZoomFor(100, 30e6, 14) == 14 && kiwi::wfZoomFor(100, 30e6, 10) == 10);
+    CHECK(kiwi::wfClampCentre(10e3, 7, 30e6) == 234375 / 2.0 && kiwi::wfClampCentre(29.99e6, 0, 30e6) == 15e6 && kiwi::wfClampCentre(7074e3, 7, 30e6) == 7074e3);
+    CHECK(kiwi::wfViewCmd(7, 7074e3) == "SET zoom=7 cf=7074.000");
+    { const unsigned char px[3] = {255, 155, 55}; float db[3]; kiwi::wfToDbm(px, 3, -13, db); CHECK(db[0] == -13.f && db[1] == -113.f && db[2] == -213.f); }
     // fuzz: random and mutated input never crash, and what is accepted keeps its bounds
     std::mt19937 rng(11);
     for (int i = 0; i < 40000; i++) {
@@ -420,6 +490,48 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(2200));
     CHECK(srv.countPrefix("SET keepalive") >= 3 && srv.countPrefix("SET keepalive") <= 8);
 
+    // the Kiwi's own waterfall: a W/F connection with the IQ one, on its time stamp (the Kiwi pairs them: one listener, and it ends the IQ when
+    // the W/F connection closes); no view command until a view is asked for; then the zoom and centre that cover the view, the frames' band and
+    // levels as sent; a pan follows, a move of less than a bin is not sent; no view: nothing more is sent, but the connection stays
+    {
+        CHECK(eventually([&] { return srv.wfCount("SET auth") >= 1 && srv.wfHas("SET wf_comp=0"); }));
+        CHECK(srv.wfCount("SET zoom=") == 0);
+        KiwiSpectrum ks;
+        CHECK(!kiwiSpectrum(d.nativeArgs, ks, 0));
+        kiwiSetSpectrumView(d.nativeArgs, 7.1e6, 200e3);
+        CHECK(eventually([&] { return srv.wfHas("SET zoom=7 cf=7100.000"); }));
+        {
+            std::lock_guard<std::mutex> lk(srv.mu);
+            CHECK(srv.wfPath.size() > 4 && srv.path.size() > 4 && srv.wfPath.substr(0, srv.wfPath.size() - 3) == srv.path.substr(0, srv.path.size() - 3));   // "/kiwi/<ts>/"
+        }
+        CHECK(srv.wfHas("SET wf_comp=0") && srv.wfHas("SET maxdb=0 mindb=-100") && srv.wfCount("SET auth t=kiwi p=s3cret%20pass") == 1);
+        CHECK(eventually([&] { return kiwiSpectrum(d.nativeArgs, ks, 0) && ks.zoom == 7; }));
+        CHECK(ks.dbm.size() == 1024 && std::fabs(ks.startHz - (7.1e6 - 234375.0 / 2)) < 5 && std::fabs(ks.binHz - 234375.0 / 1024) < 1e-6 && ks.bandwidthHz == 30e6);
+        if (ks.dbm.size() == 1024) {
+            const size_t k = (size_t)std::floor((Fake::kWfToneHz - ks.startHz) / ks.binHz);
+            CHECK(k < 1024 && ks.dbm[k] == 200 - 255 - 13 && ks.dbm[0] == 100 - 255 - 13);   // 255 + dBm, with the owner's calibration (wf_cal=-13)
+        }
+        CHECK(eventually([&] { return kiwiStatus(d.nativeArgs).wfConnected; }));
+        const uint64_t s0 = ks.seq;
+        CHECK(eventually([&] { return kiwiSpectrum(d.nativeArgs, ks, s0); }));   // the frames go on
+        kiwiSetSpectrumView(d.nativeArgs, 7.2e6, 200e3);
+        CHECK(eventually([&] { return srv.wfHas("SET zoom=7 cf=7200.000"); }));
+        const int nz = srv.wfCount("SET zoom=");
+        kiwiSetSpectrumView(d.nativeArgs, 7.2e6 + 50, 200e3);   // a quarter of a bin
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        CHECK(srv.wfCount("SET zoom=") == nz);
+        kiwiSetSpectrumView(d.nativeArgs, 7.2e6, 30e6);   // the whole band
+        CHECK(eventually([&] { return srv.wfHas("SET zoom=0 cf=15000.000"); }));
+        CHECK(eventually([&] { return kiwiSpectrum(d.nativeArgs, ks, 0) && ks.zoom == 0 && std::fabs(ks.startHz) < 1; }));
+        const int nz2 = srv.wfCount("SET zoom=");
+        kiwiSetSpectrumView(d.nativeArgs, 0, 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        CHECK(srv.wfClosed == 0 && srv.wfCount("SET zoom=") == nz2 && kiwiStatus(d.nativeArgs).wfConnected);
+        CHECK(srv.connections == 2);   // the IQ connection was not touched
+        ring.clear();
+        CHECK(readIq(ring, buf));
+    }
+
     // a sequence gap is filled with silence and counted; junk frames are ignored; the stream goes on
     ring.clear();
     const uint64_t g0 = kiwiStatus(d.nativeArgs).gapFrames;
@@ -491,8 +603,26 @@ int main() {
     CHECK(eventually([&] { return srv.connections > c2; }, 8000));
     ring.clear();
     CHECK(readIq(ring, buf));
+    kiwiSetSpectrumView(d.nativeArgs, 7.1e6, 200e3);
+    CHECK(eventually([&] { return kiwiStatus(d.nativeArgs).wfConnected; }, 8000));   // the waterfall came back with the last reconnect, the view sent again
+    const int closedBefore = srv.wfClosed;
     src->stop();
     CHECK(!kiwiStatus(d.nativeArgs).connected);
+    {   // stop closes the waterfall with the IQ; with the setting off there is no waterfall connection at all
+        CHECK(eventually([&] { return srv.wfClosed > closedBefore; }));
+        CHECK(!kiwiStatus(d.nativeArgs).wfConnected);
+        const int auths = srv.wfCount("SET auth");
+        auto src2 = native::makeKiwiSdr(d);
+        TuneSettings t2 = t;
+        t2.radio["kiwiwf"] = "0";
+        err.clear();
+        CHECK(src2->start(t2, ring, err));
+        ring.clear();
+        CHECK(readIq(ring, buf));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        CHECK(srv.wfCount("SET auth") == auths);
+        src2->stop();
+    }
     srv.stop();
 
     if (fails) { fprintf(stderr, "%d checks failed\n", fails); return 1; }

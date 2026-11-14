@@ -123,7 +123,15 @@ inline void decodeIq(const unsigned char* p, const Snd& s, float* out /* 2 float
 }
 
 // ---- W/F -----------------------------------------------------------------------------------------------------------------------------------
-struct Wf { uint32_t xBin = 0, flagsZoom = 0, seq = 0; size_t pixOff = 16, pixels = 0; };
+// The Kiwi's own waterfall: a second WebSocket (/kiwi/<the SND's time>/W/F, so both count as one listener) that sends 1024 levels over
+// bandwidth / 2^zoom, computed by the server. Checked against a live Kiwi (v1.902) and the KiwiSDR sources (rx_waterfall.cpp, openwebrx.js):
+//  - after MSG wf_setup: SET zoom=<0..zoom_max> cf=<kHz> (v1.329 on), SET maxdb/mindb (needed, values unused), SET wf_speed=1..4, SET wf_comp=0
+//  - the server answers MSG zoom=Z start=<x_bin>; every frame carries x_bin and the zoom (low 16 bits of flags_x_zoom; 0x10000 and up are flags)
+//  - x_bin counts bins of the deepest zoom: start Hz = x_bin * bandwidth / (1024 * 2^14)
+//  - a level is 255 + dBm (0 .. -200 dBm map to 255 .. 55), plus the owner's calibration wf_cal (MSG wf_cal=N, dB)
+constexpr int kWfBins = 1024, kWfMaxZoom = 14;
+constexpr uint32_t kWfCompressed = 0x10000;
+struct Wf { uint32_t xBin = 0, flagsZoom = 0, seq = 0; size_t pixOff = 16, pixels = 0; int zoom() const { return (int)(flagsZoom & 0xFFFF); } };
 inline bool parseWf(const unsigned char* p, size_t n, Wf& o) {
     o = Wf();
     if (n < 16 || memcmp(p, "W/F", 3) != 0) return false;
@@ -132,6 +140,21 @@ inline bool parseWf(const unsigned char* p, size_t n, Wf& o) {
     o.pixels = n - 16;
     return true;
 }
+inline double wfSpanHz(int zoom, double bandwidthHz) { return bandwidthHz / double(1u << std::min(std::max(zoom, 0), kWfMaxZoom)); }
+inline double wfStartHz(uint32_t xBin, double bandwidthHz) { return xBin * bandwidthHz / (double(kWfBins) * double(1u << kWfMaxZoom)); }
+// the deepest zoom whose span still holds spanHz (0: the whole band)
+inline int wfZoomFor(double spanHz, double bandwidthHz, int zoomMax) {
+    int z = 0;
+    while (z < std::min(zoomMax, kWfMaxZoom) && wfSpanHz(z + 1, bandwidthHz) >= spanHz) z++;
+    return z;
+}
+// the centre that keeps the whole span inside 0 .. bandwidth (the Kiwi clamps the same way)
+inline double wfClampCentre(double centreHz, int zoom, double bandwidthHz) {
+    const double h = wfSpanHz(zoom, bandwidthHz) / 2;
+    return std::min(std::max(centreHz, h), bandwidthHz - h);
+}
+// levels to dBm (the Kiwi page's scale); n values to out
+inline void wfToDbm(const unsigned char* px, size_t n, int wfCal, float* out) { for (size_t i = 0; i < n; i++) out[i] = (float)px[i] - 255.f + (float)wfCal; }
 
 // ---- commands ------------------------------------------------------------------------------------------------------------------------------
 inline std::string freqKHz(double hz) {
@@ -143,6 +166,7 @@ inline std::string authCmd(const std::string& password) { return "SET auth t=kiw
 inline std::string tuneCmd(double hz, int cutHz) {   // IQ mode: the passband is symmetric around the tuned frequency
     return "SET mod=iq low_cut=" + std::to_string(-cutHz) + " high_cut=" + std::to_string(cutHz) + " freq=" + freqKHz(hz);
 }
+inline std::string wfViewCmd(int zoom, double centreHz) { return "SET zoom=" + std::to_string(zoom) + " cf=" + freqKHz(centreHz); }
 inline std::string agcCmd(bool on, int manualGainDb) {
     return std::string("SET agc=") + (on ? "1" : "0") + " hang=0 thresh=-100 slope=6 decay=1000 manGain=" + std::to_string(manualGainDb);
 }
