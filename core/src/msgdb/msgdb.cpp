@@ -1,3 +1,4 @@
+#include "dect2/acars/acars_readable.h"
 #include "dect2/common/thread_name.h"
 #include "dect2/msgdb/msgdb.h"
 #include <sqlite3.h>
@@ -230,6 +231,7 @@ struct Db::Impl {
         if (f.since > 0) { andw("m.t >= ?"); b.push_back({true, f.since, ""}); }
         if (f.until > 0) { andw("m.t <= ?"); b.push_back({true, f.until, ""}); }
         if (f.posOnly) andw("m.lat IS NOT NULL");
+        if (f.readableOnly) andw("m.type IN ('acars.message','msg.aero','vdl2.message','hfdl.message') AND onair_readable(m.type, m.extra, m.txt)");
         if (f.sessionId != 0) { andw("m.sid = ?"); b.push_back({true, 0, "", f.sessionId, true}); }
         sql += w;
     }
@@ -380,6 +382,12 @@ bool Db::open(const std::string& path, std::string* err) {
     }
     p_->db = db;
     sqlite3_busy_timeout(db, 3000);
+    // onair_readable(type, extra, text): Filter::readableOnly in SQL, so the paging and the count of matches stay right
+    sqlite3_create_function_v2(db, "onair_readable", 3, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nullptr,
+        [](sqlite3_context* ctx, int, sqlite3_value** v) {
+            auto s = [&](int i) { const unsigned char* p = sqlite3_value_text(v[i]); return p ? std::string(reinterpret_cast<const char*>(p), (size_t)sqlite3_value_bytes(v[i])) : std::string(); };
+            sqlite3_result_int(ctx, msgReadable(s(0), s(1), s(2)) ? 1 : 0);
+        }, nullptr, nullptr, nullptr);
     p_->exec("PRAGMA auto_vacuum=INCREMENTAL");   // only takes effect on a new file
     if (path != ":memory:") { p_->exec("PRAGMA journal_mode=WAL"); p_->exec("PRAGMA synchronous=NORMAL"); }
     const char* schema =

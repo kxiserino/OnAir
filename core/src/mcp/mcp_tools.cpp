@@ -1,5 +1,6 @@
 // The MCP tools. Each one is a thin layer over the remote-control host (RemoteApiHost) and the engine's signal identifier; no tool touches the
 // file system, a shell, keys, credentials or settings, and the transmit tools exist only when Options::allowTx is on.
+#include "dect2/acars/acars_readable.h"
 #include "dect2/bandplan/bandplan.h"
 #include "dect2/source/gain.h"
 #include "dect2/fm/rds_live.h"
@@ -855,9 +856,12 @@ std::vector<Tool> makeTools() {
         t.schema = Schema()
                        .add("since", prop("integer", "Cursor from the previous call (omit: the most recent messages)."))
                        .add("max", prop("integer", "At most this many (default 50, at most 200)."))
+                       .add("readable_only", prop("boolean", "Only ACARS, VDL2, HFDL and Inmarsat Aero messages with text a person can read (free text, weather, operations notes): "
+                                                             "no ADS-C, CPDLC, FMS or datalink data, encrypted blocks, acknowledgements, nor other modes. The cursor still moves past the others."))
                        .done();
         t.readOnly = true; t.idempotent = true;
         t.fn = [](ToolCtx& c, const Json& a) {
+            const bool readable = a.boolOr("readable_only", false);
             uint64_t cur = a.has("since") ? (uint64_t)std::max(0.0, a.numOr("since", 0)) : 0;
             const size_t mx = (size_t)std::max(1.0, std::min(200.0, a.numOr("max", 50)));
             std::vector<std::string> lines;
@@ -869,6 +873,17 @@ std::vector<Tool> makeTools() {
                 o.setStr("note", "This host keeps no message stream; the decoder's live data is in 'decoder'.");
                 o.set("decoder", trimmedTelemetry(hostJson(c.host.telemetryJson(seq))));
                 return o;
+            }
+            if (readable) {   // acars_readable.h, the same test as View > Messages > Readable text only
+                std::vector<std::string> keep;
+                for (const std::string& l : lines) {
+                    const Json e = hostJson(l);
+                    const Json* f = e.get("fields");
+                    if (!f || !f->isObj()) continue;
+                    const std::string text = f->has("text") ? f->strOr("text") : f->strOr("summary");
+                    if (msgReadable(e.strOr("type"), "label=" + f->strOr("label") + "\n", text)) keep.push_back(l);
+                }
+                lines.swap(keep);
             }
             Json arr = Json::array();
             size_t from = lines.size() > mx ? lines.size() - mx : 0;   // no cursor given: the newest ones

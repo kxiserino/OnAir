@@ -39,6 +39,7 @@ struct Filter {
     std::string source;       // substring of the source file name, empty = any
     int64_t sessionId = 0;    // only the record of this session (0 = any)
     bool relevance = false;   // order by text relevance (bm25: identity > message > extra) instead of newest first; needs text
+    bool readableOnly = false;   // only ACARS-family messages (ACARS, VDL2, HFDL, Inmarsat Aero) whose text a person can read (dect2/acars/acars_readable.h)
     int limit = 500;
     int offset = 0;
     bool oldestFirst = false;

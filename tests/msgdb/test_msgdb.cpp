@@ -225,7 +225,39 @@ void testSearchFeatures() {
     CHECK(db.count(f) == 3, "prefix with relevance");
 }
 
+// Filter::readableOnly: an SQL function, so the page and the count agree; only ACARS-family rows with readable text
+void testReadable() {
+    Db db;
+    CHECK(db.open(":memory:"), "open");
+    auto aero = [](const char* reg, const char* label, const char* text, double t) {
+        au::Event e("msg.aero");
+        e.at(t, "Inmarsat Aero", 0);
+        e.str("registration", reg).str("label", label).str("source", reg).str("text", text);
+        return e;
+    };
+    Record r;
+    int added = 0;
+    for (const au::Event& e : {aero("EC-MXV", "A9", "RECIBIDO ETOPS OK BUEN VUELO", kT0), aero("OH-LWA", "B6", "CREW REPORTED TURBULENCE AT FL350", kT0 + 1),
+                               aero("OH-LWB", "H1", "- #DFB REQUEST DATA FROM THE GROUND", kT0 + 2), aero("G-EUPT", "MA", "T.0&HDeF/k2l9Qx!zP0#a8VbN", kT0 + 3),
+                               aero("G-EUPU", "10", "CREW REPORTED TURBULENCE AT FL350", kT0 + 4), acars("G-ABCD", "PLEASE CALL OPS ON ARRIVAL TODAY", kT0 + 5),
+                               pager(1234567, "FIRE ALARM AT THE MAIN STATION TODAY", kT0 + 6)})
+        if (fromEvent(e, r) && db.add(r)) added++;
+    CHECK(added == 7, "rows added (%d)", added);
+    Filter f;
+    f.readableOnly = true;
+    const auto rows = db.query(f);
+    CHECK(rows.size() == 3 && db.count(f) == 3, "readable rows: %zu, count %lld", rows.size(), (long long)db.count(f));
+    for (const Record& x : rows)
+        CHECK(x.text == "RECIBIDO ETOPS OK BUEN VUELO" || x.text == "PLEASE CALL OPS ON ARRIVAL TODAY" || (x.text == "CREW REPORTED TURBULENCE AT FL350" && x.extra.find("label=10") != std::string::npos),
+              "readable row: %s", x.text.c_str());
+    f.text = "turbulence";
+    CHECK(db.count(f) == 1, "with a search: only the readable one of the two turbulence rows");
+    f = Filter();
+    CHECK(db.count(f) == 7, "off: everything");
+}
+
 int main() {
+    testReadable();
     testSearchFeatures();
     testBasic();
     testRefusals();

@@ -27,6 +27,7 @@ struct St {
     char ident[64] = "";
     int modeSel = 0, range = 0;
     bool posOnly = false, relevance = false;
+    bool readable = false;   // only ACARS / VDL2 / HFDL / Inmarsat Aero messages with text a person can read (acars_readable.h)
     float fLoMHz = 0, fHiMHz = 0;   // frequency range filter in MHz (0 = open)
     char source[96] = "";        // source (recording) file filter
     int page = 0;
@@ -105,6 +106,7 @@ mdb::Filter filter() {
     static const double span[] = {0, 3600, 86400, 7 * 86400, 30 * 86400};
     if (S.range > 0) f.since = au::wallNow() - span[S.range];
     f.posOnly = S.posOnly;
+    f.readableOnly = S.readable;
     f.freqLo = S.fLoMHz * 1e6; f.freqHi = S.fHiMHz * 1e6;
     f.source = S.source;
     f.relevance = S.relevance;
@@ -200,6 +202,10 @@ void windowPanel(App& a) {
     }
     ImGui::SameLine();
     ch |= ImGui::Checkbox(tr("With position"), &S.posOnly);
+    ImGui::SameLine();
+    ch |= ImGui::Checkbox(tr("Readable text only"), &S.readable);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("ACARS, VDL2, HFDL and Inmarsat Aero messages that a person wrote or reads (free text, weather, operations notes); "
+                                                           "no ADS-C, CPDLC, FMS and datalink data, encrypted blocks or acknowledgements, and no other modes"));
     ImGui::SetNextItemWidth(90 * gUi); ch |= ImGui::InputFloat("##flo", &S.fLoMHz, 0, 0, "%.4f");
     ImGui::SameLine(); ImGui::TextUnformatted("-"); ImGui::SameLine();
     ImGui::SetNextItemWidth(90 * gUi); ch |= ImGui::InputFloat("##fhi", &S.fHiMHz, 0, 0, "%.4f");
